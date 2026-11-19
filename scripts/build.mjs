@@ -1,6 +1,6 @@
 import * as esbuild from 'esbuild';
 import { deflateSync } from 'zlib';
-import { mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, cpSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -22,7 +22,7 @@ const define = {
 /** Create a solid-color PNG of the given size (RGBA). */
 function createPng(size, rgba = [26, 122, 92, 255]) {
   const [r, g, b, a] = rgba;
-  const raw = Buffer.alloc((size * size * 4) + size);
+  const raw = Buffer.alloc(size * size * 4 + size);
   let offset = 0;
   for (let y = 0; y < size; y++) {
     raw[offset++] = 0; // filter none
@@ -86,6 +86,17 @@ function copyStatic() {
   for (const size of [16, 48, 128]) {
     writeFileSync(join(iconsDir, `icon${size}.png`), createPng(size));
   }
+
+  const sidepanelDist = join(dist, 'sidepanel');
+  mkdirSync(sidepanelDist, { recursive: true });
+  cpSync(
+    join(root, 'src/sidepanel/index.html'),
+    join(sidepanelDist, 'index.html')
+  );
+  cpSync(
+    join(root, 'src/sidepanel/sidepanel.css'),
+    join(sidepanelDist, 'sidepanel.css')
+  );
 }
 
 const contentBuild = {
@@ -110,13 +121,26 @@ const backgroundBuild = {
   define,
 };
 
+const sidepanelBuild = {
+  entryPoints: [join(root, 'src/sidepanel/sidepanel.ts')],
+  bundle: true,
+  outfile: join(dist, 'sidepanel/sidepanel.js'),
+  format: 'esm',
+  target: ['chrome110'],
+  sourcemap: true,
+  logLevel: 'info',
+  define,
+};
+
 copyStatic();
 
 async function buildOnce() {
   await Promise.all([
     esbuild.build(contentBuild),
     esbuild.build(backgroundBuild),
+    esbuild.build(sidepanelBuild),
   ]);
+  copyStatic();
   console.log('[SCF Extension] build complete →', dist);
   console.log('[SCF Extension] API base:', apiBase);
 }
@@ -124,7 +148,12 @@ async function buildOnce() {
 if (watch) {
   const ctxContent = await esbuild.context(contentBuild);
   const ctxBg = await esbuild.context(backgroundBuild);
-  await Promise.all([ctxContent.watch(), ctxBg.watch()]);
+  const ctxSide = await esbuild.context(sidepanelBuild);
+  await Promise.all([
+    ctxContent.watch(),
+    ctxBg.watch(),
+    ctxSide.watch(),
+  ]);
   console.log('[SCF Extension] watching… load unpacked from:', dist);
 } else {
   await buildOnce();

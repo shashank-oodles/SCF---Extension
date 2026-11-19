@@ -2,88 +2,117 @@ import type { FilterInterval, PlaybackSnapshot } from '../types';
 import { logger } from '../utils/logger';
 
 /**
- * Applies timestamp-based mute intervals while preserving the user's
- * intentional mute preference outside filter windows.
+ * Mutes only while currentTime is inside a mute interval.
+ * Seeks/jumps outside that range unmute immediately (unless the user
+ * had already muted before we took over).
  */
 export class MuteFilter {
   private muteIntervals: FilterInterval[] = [];
-  private activeIds = new Set<string>();
-  private userMutedBeforeFilter: boolean | null = null;
+  /** True while we forced muted=true for a filter window */
   private filterOwnsMute = false;
+  /** User's muted state when we first entered a mute window */
+  private userMutedBeforeFilter: boolean | null = null;
+  /** User manually unmuted inside a window — don't remute until they leave and re-enter */
+  private userReleasedDuringInterval = false;
+  private lastInRange = false;
 
   setIntervals(filters: FilterInterval[]): void {
     this.muteIntervals = filters
       .filter((f) => f.action === 'mute')
       .slice()
       .sort((a, b) => a.start - b.start);
-    this.activeIds.clear();
   }
 
-  reset(): void {
-    this.activeIds.clear();
-    this.userMutedBeforeFilter = null;
-    this.filterOwnsMute = false;
+  reset(video: HTMLVideoElement | null = null): void {
+    this.releaseMute(video);
+    this.userReleasedDuringInterval = false;
+    this.lastInRange = false;
+  }
+
+  detach(video: HTMLVideoElement | null): void {
+    this.reset(video);
   }
 
   /**
-   * Call when the video element is replaced so we do not restore mute onto
-   * a different element incorrectly.
+   * Idempotent sync: mute iff currentTime is in a mute range.
+   * Safe to call on timeupdate, seeking, and seeked.
    */
-  detach(video: HTMLVideoElement | null): void {
-    if (video && this.filterOwnsMute && this.userMutedBeforeFilter === false) {
-      video.muted = false;
-    }
-    this.reset();
-  }
-
   evaluate(video: HTMLVideoElement, snapshot: PlaybackSnapshot): void {
     const t = snapshot.currentTime;
-    const overlapping = this.muteIntervals.filter(
+    const inRange = this.muteIntervals.some(
       (f) => t >= f.start && t < f.end
     );
-    const nextIds = new Set(overlapping.map((f) => f.id));
 
-    const wasActive = this.activeIds.size > 0;
-    const nowActive = nextIds.size > 0;
-
-    if (!wasActive && nowActive) {
-      // Entering mute region(s) — remember user mute preference once
-      this.userMutedBeforeFilter = video.muted;
-      if (!video.muted) {
-        video.muted = true;
-        this.filterOwnsMute = true;
-        logger.debug('Mute applied', { t, ids: [...nextIds] });
-      } else {
-        // User already muted; do not claim ownership
-        this.filterOwnsMute = false;
-        logger.debug('Mute interval entered; user already muted', { t });
-      }
-    } else if (wasActive && !nowActive) {
-      // Exiting all mute regions
-      if (this.filterOwnsMute && this.userMutedBeforeFilter === false) {
-        video.muted = false;
-        logger.debug('Mute restored (unmuted)', { t });
-      } else {
-        logger.debug('Mute interval exited; preserving user mute state', { t });
-      }
-      this.userMutedBeforeFilter = null;
-      this.filterOwnsMute = false;
-    } else if (nowActive && this.filterOwnsMute && !video.muted) {
-      // User unmuted mid-interval — stop owning mute for this stretch
-      this.filterOwnsMute = false;
-      this.userMutedBeforeFilter = false;
-      logger.debug('User unmuted during filter interval; releasing ownership');
+    if (inRange) {
+      this.syncInsideRange(video, t);
+    } else {
+      this.syncOutsideRange(video, t);
     }
 
-    // Overlapping consecutive intervals: keep muted while any remain active
-    if (nowActive && this.filterOwnsMute && !video.muted) {
-      video.muted = true;
-    }
-
-    this.activeIds = nextIds;
+    this.lastInRange = inRange;
   }
 
-  getActiveIds(): string[] {
-    return [...this.activeIds];
+  private syncInsideRange(video: HTMLVideoElement, t: number): void {
+    if (!this.lastInRange) {
+      this.userReleasedDuringInterval = false;
+      this.userMutedBeforeFilter = video.muted;
+
+      if (video.muted) {
+        this.filterOwnsMute = false;
+        logger.debug('Mute interval entered; user already muted', { t });
+        return;
+      }
+
+      video.muted = true;
+      this.filterOwnsMute = true;
+      logger.debug('Mute applied', { t });
+      return;
+    }
+
+    if (this.userReleasedDuringInterval) {
+      return;
+    }
+
+    if (this.filterOwnsMute) {
+      if (!video.muted) {
+        // User unmuted mid-interval — stay unmuted until they leave this window
+        this.filterOwnsMute = false;
+        this.userReleasedDuringInterval = true;
+        this.userMutedBeforeFilter = null;
+        logger.debug(
+          'User unmuted during filter interval; releasing ownership',
+          { t }
+        );
+      }
+      return;
+    }
+
+    if (!video.muted) {
+      this.userMutedBeforeFilter = false;
+      video.muted = true;
+      this.filterOwnsMute = true;
+      logger.debug('Mute re-applied while still in range', { t });
+    }
+  }
+
+  private syncOutsideRange(video: HTMLVideoElement, t: number): void {
+    if (this.filterOwnsMute || this.lastInRange) {
+      logger.debug('Left mute range', { t, owned: this.filterOwnsMute });
+    }
+    this.releaseMute(video);
+    this.userReleasedDuringInterval = false;
+  }
+
+  private releaseMute(video: HTMLVideoElement | null): void {
+    if (
+      video &&
+      this.filterOwnsMute &&
+      this.userMutedBeforeFilter === false
+    ) {
+      video.muted = false;
+      logger.debug('Mute restored (unmuted)');
+    }
+    this.filterOwnsMute = false;
+    this.userMutedBeforeFilter = null;
   }
 }

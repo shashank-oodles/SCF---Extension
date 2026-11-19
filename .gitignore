@@ -6,8 +6,6 @@ dist/
 *.tsbuildinfo
 
 # Environment
-.env
-.env.local
 .env.*.local
 !.env.example
 
@@ -20,10 +18,10 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 .idea/
-.vscode/
 *.swp
 *.swo
 
 # Test / coverage
 coverage/
 .nyc_output/
+config.bat

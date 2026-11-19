@@ -9,6 +9,7 @@ const STATUS_COPY: Record<ExtensionStatus, string> = {
   filtering_active: 'Filtering active',
   backend_failed: 'Backend connection failed',
   title_not_matched: 'Title not matched',
+  awaiting_selection: 'Choose a title',
   idle: 'Idle',
 };
 
@@ -19,6 +20,7 @@ const STATUS_COLOR: Record<ExtensionStatus, string> = {
   filtering_active: '#1a7a5c',
   backend_failed: '#be123c',
   title_not_matched: '#b45309',
+  awaiting_selection: '#ca8a04',
   idle: '#5a6b7a',
 };
 
