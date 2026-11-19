@@ -91,6 +91,9 @@ export class FilterManager {
   ): void {
     if (event === 'seeking') {
       this.skipFilter.onSeeking();
+      // Sync mute immediately to the seek target so jumps out of a mute
+      // window unmute without waiting for seeked.
+      this.muteFilter.evaluate(video, snapshot);
       return;
     }
 
@@ -103,7 +106,7 @@ export class FilterManager {
     }
 
     if (event === 'ended') {
-      this.muteFilter.reset();
+      this.muteFilter.reset(video);
       this.skipFilter.resetExecutionState();
       return;
     }

@@ -1,4 +1,5 @@
 export type FilterAction = 'mute' | 'skip';
+export type TitleKind = 'movie' | 'show';
 
 export interface FilterInterval {
   id: string;
@@ -11,7 +12,10 @@ export interface FilterInterval {
 export interface TitleFilterConfig {
   titleId: string;
   title: string;
+  kind?: TitleKind;
+  episodeName?: string;
   provider: 'prime-video';
+  videoUrl?: string;
   matchPatterns: string[];
   filters: FilterInterval[];
 }
@@ -35,6 +39,7 @@ export type ExtensionStatus =
   | 'filtering_active'
   | 'backend_failed'
   | 'title_not_matched'
+  | 'awaiting_selection'
   | 'idle';
 
 export interface PlaybackSnapshot {

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SCF</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>SCF</h1>
+          <p class="tagline">Streaming Content Filtering</p>
+        </div>
+      </div>
+      <div id="status-pill" class="pill pill-neutral">Waiting</div>
+    </header>
+
+    <section class="card" id="player-card">
+      <h2>Player</h2>
+      <p id="player-detail" class="muted">Open a Prime Video title and press play.</p>
+    </section>
+
+    <section class="card" id="series-card" hidden>
+      <h2 id="series-label">Series</h2>
+      <p id="series-detail" class="muted"></p>
+      <div id="candidate-list" class="list"></div>
+    </section>
+
+    <section class="card" id="active-card" hidden>
+      <h2>Active filters</h2>
+      <p id="active-title" class="active-title"></p>
+      <p id="active-meta" class="muted"></p>
+      <ul id="active-filters" class="filters"></ul>
+    </section>
+
+    <footer class="footer">
+      <p class="muted">
+        Click the SCF icon to open this side panel anytime. Filters apply only
+        while the Prime player is open.
+      </p>
+    </footer>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>
