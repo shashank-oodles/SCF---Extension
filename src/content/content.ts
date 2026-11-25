@@ -1,93 +1,94 @@
 import {
-  ExtensionContextInvalidatedError,
-  fetchAllTitleConfigs,
-  isExtensionContextValid,
-} from '../services/filterApi';
+  extractPrimePageInfo,
+  type PrimePageInfo,
+} from '../services/primeTitleExtractor';
 import {
-  findSeriesCandidates,
-  type SeriesMatchResult,
-} from '../services/seriesMatch';
-import type { ExtensionStatus, TitleFilterConfig } from '../types';
+  applyPrimeNetworkMessage,
+  clearPlaybackCatalog,
+  findCatalogEpisode,
+  getPrimeCatalog,
+  pageKeyFromUrl,
+  resetPrimeCatalog,
+  subscribePrimeCatalog,
+} from '../services/primeCatalog';
+import type { ExtensionStatus } from '../types';
 import type { SidePanelState } from '../types/panel';
 import { logger } from '../utils/logger';
 import { StatusDot } from '../utils/statusDot';
-import { FilterManager } from './filterManager';
-import { isPlayerOpen } from './playerGate';
+import {
+  getPrimaryPlaybackVideo,
+  invalidatePlayerGateCache,
+  isPlayerOpen,
+} from './playerGate';
 import { VideoDetector } from './videoDetector';
 
-const CONFIG_REFRESH_MS = 20_000;
+const REFRESH_MS = 4_000;
+const PLAYBACK_TICK_MS = 1_000;
 
 const statusDot = new StatusDot();
-const filterManager = new FilterManager((s, detail) => {
-  if (!matchedConfig) return;
-  if (s === 'filtering_active') {
-    uiStatus = 'filtering_active';
-    if (detail) uiDetail = detail;
-    publishState();
-  }
-});
 
-/** Remember which episode the user picked for a series during this page session */
-const selectionBySeries = new Map<string, string>();
-
-let titleConfigs: TitleFilterConfig[] = [];
-let matchedConfig: TitleFilterConfig | null = null;
-let activeSeries: SeriesMatchResult | null = null;
+let detected: PrimePageInfo | null = null;
+let selectedEpisode: string | null = null;
+let selectedGti: string | null = null;
 let uiStatus: ExtensionStatus = 'initialized';
-let uiDetail = 'Waiting for player';
+let uiDetail = 'Open a movie or show on Prime Video';
 let lastHref = '';
-let loadingFilters = false;
-let lastConfigFetchAt = 0;
-let detector: VideoDetector | null = null;
-let pollTimer: number | null = null;
-let contextInvalidated = false;
+let lastPageKey = '';
+let lastFingerprint = '';
 let lastPlayerOpen = false;
+let detector: VideoDetector | null = null;
 let sidePanelOpen = false;
-
-function handleContextInvalidated(): void {
-  if (contextInvalidated) return;
-  contextInvalidated = true;
-
-  if (pollTimer !== null) {
-    window.clearInterval(pollTimer);
-    pollTimer = null;
-  }
-
-  uiStatus = 'backend_failed';
-  uiDetail = 'Extension reloaded — refresh this tab';
-  publishState();
-  logger.warn(
-    'Extension context invalidated. Refresh this Prime Video tab after reloading the extension.'
-  );
-}
+let contextInvalidated = false;
 
 function syncStatusDot(): void {
-  const filtering = Boolean(matchedConfig) && uiStatus === 'filtering_active';
-  statusDot.setStatus(uiStatus, filtering);
-  // Dot only while side panel is closed
+  const active = Boolean(
+    (detected?.title && detected.title !== 'Unknown title') || detected?.gti
+  );
+  statusDot.setStatus(uiStatus, active && isPlayerOpen());
   statusDot.setVisible(!sidePanelOpen);
+}
+
+function readPlaybackTime(): number | null {
+  if (!isPlayerOpen()) return null;
+  const video = getPrimaryPlaybackVideo() ?? detector?.getCurrent() ?? null;
+  if (!video) return null;
+  return Number.isFinite(video.currentTime) ? video.currentTime : null;
+}
+
+function resetSelection(reason: string): void {
+  selectedEpisode = null;
+  selectedGti = null;
+  detected = null;
+  lastFingerprint = '';
+  logger.info('Selection reset', { reason });
 }
 
 function publishState(detailOverride?: string): void {
   if (detailOverride) uiDetail = detailOverride;
 
+  const playerOpen = isPlayerOpen();
+  const gti = detected?.gti || selectedGti || undefined;
   const state: SidePanelState = {
-    playerOpen: isPlayerOpen(),
+    playerOpen,
     sidePanelOpen,
     status: uiStatus,
     statusDetail: uiDetail,
-    seriesLabel: activeSeries?.seriesLabel ?? null,
-    seriesKey: activeSeries?.seriesKey ?? null,
-    reasons: activeSeries?.reasons ?? [],
-    candidates: (activeSeries?.candidates ?? []).map((c) => ({
-      titleId: c.titleId,
-      title: c.title,
-      kind: c.kind,
-      episodeName: c.episodeName,
-      filterCount: c.filters.length,
-      filters: c.filters,
-    })),
-    selectedId: matchedConfig?.titleId ?? null,
+    detected: detected
+      ? {
+          kind: detected.kind,
+          title: detected.title,
+          episodeName: detected.episodeName,
+          seasonLabel: detected.seasonLabel,
+          gti,
+          parentGti: detected.parentGti,
+          pageUrl: location.href,
+          episodes: detected.episodes,
+          sources: detected.sources,
+        }
+      : null,
+    selectedEpisode,
+    selectedGti: gti || null,
+    currentTime: playerOpen ? readPlaybackTime() : null,
     updatedAt: Date.now(),
   };
 
@@ -102,7 +103,9 @@ function publishState(detailOverride?: string): void {
       }
     })
     .catch(() => {
-      // background may be restarting
+      if (!chrome.runtime?.id) {
+        contextInvalidated = true;
+      }
     });
 }
 
@@ -117,207 +120,174 @@ function openSidePanelFromDot(): void {
   });
 }
 
-async function ensureConfigsLoaded(force = false): Promise<boolean> {
-  if (contextInvalidated || !isExtensionContextValid()) {
-    handleContextInvalidated();
-    return titleConfigs.length > 0;
-  }
-
-  const stale =
-    force ||
-    titleConfigs.length === 0 ||
-    Date.now() - lastConfigFetchAt > CONFIG_REFRESH_MS;
-
-  if (!stale) return true;
-  if (loadingFilters) return titleConfigs.length > 0;
-
-  loadingFilters = true;
-  try {
-    titleConfigs = await fetchAllTitleConfigs();
-    lastConfigFetchAt = Date.now();
-    logger.info('Loaded title configs', titleConfigs.length);
-    return true;
-  } catch (err) {
-    if (err instanceof ExtensionContextInvalidatedError) {
-      handleContextInvalidated();
-      return titleConfigs.length > 0;
-    }
-
-    uiStatus = 'backend_failed';
-    uiDetail = err instanceof Error ? err.message : 'API error';
-    publishState();
-    logger.error('Failed to load title configs', err);
-    return titleConfigs.length > 0;
-  } finally {
-    loadingFilters = false;
-  }
-}
-
-function clearMatch(reason: string): void {
-  if (matchedConfig || activeSeries) {
-    logger.info('Clearing title selection', {
-      reason,
-      previousTitleId: matchedConfig?.titleId ?? null,
-    });
-  }
-  matchedConfig = null;
-  activeSeries = null;
-  filterManager.detachVideo();
-}
-
-function applySelectedConfig(config: TitleFilterConfig): void {
-  const previousId = matchedConfig?.titleId;
-  matchedConfig = config;
-  filterManager.loadConfig(config);
-
-  if (activeSeries) {
-    selectionBySeries.set(activeSeries.seriesKey, config.titleId);
-  }
-
-  const video = detector?.getCurrent();
-  if (video && isPlayerOpen()) {
-    filterManager.detachVideo();
-    filterManager.attachVideo(video);
-  }
-
-  uiStatus = 'filtering_active';
-  uiDetail = config.episodeName
-    ? `${config.title} · ${config.episodeName}`
-    : config.title;
-  publishState();
-
-  logger.info('User selected filter config', {
-    titleId: config.titleId,
-    title: config.title,
-    episodeName: config.episodeName,
-    filterCount: config.filters.length,
-    previousTitleId: previousId ?? null,
-  });
-}
-
-function presentSeries(series: SeriesMatchResult): void {
-  activeSeries = series;
-
-  const rememberedId = selectionBySeries.get(series.seriesKey);
-  const remembered = series.candidates.find((c) => c.titleId === rememberedId);
-
-  if (series.candidates.length === 1 && series.candidates[0].kind !== 'show') {
-    applySelectedConfig(series.candidates[0]);
+function syncSelectionFromCatalog(info: PrimePageInfo): void {
+  if (info.kind === 'movie') {
+    selectedEpisode = null;
+    selectedGti = info.gti || getPrimeCatalog().playingGti || null;
     return;
   }
 
-  if (remembered) {
-    applySelectedConfig(remembered);
+  if (info.kind !== 'show') {
+    if (info.gti) selectedGti = info.gti;
     return;
   }
 
-  matchedConfig = null;
-  filterManager.detachVideo();
-  uiStatus = 'awaiting_selection';
-  uiDetail = `${series.seriesLabel} · ${series.candidates.length} options`;
-  publishState();
+  const catalog = getPrimeCatalog();
+  const active =
+    (info.gti && findCatalogEpisode(info.gti)) ||
+    (catalog.playingGti && findCatalogEpisode(catalog.playingGti)) ||
+    info.episodes.find((e) => e.nowPlaying) ||
+    (info.episodeName
+      ? info.episodes.find(
+          (e) => e.name.toLowerCase() === info.episodeName!.toLowerCase()
+        )
+      : undefined);
 
-  logger.info('Series ready for side-panel selection', {
-    seriesKey: series.seriesKey,
-    seriesLabel: series.seriesLabel,
-    reasons: series.reasons,
-    options: series.candidates.map((c) => ({
-      titleId: c.titleId,
-      episodeName: c.episodeName,
-      filters: c.filters.length,
-    })),
-  });
-}
-
-async function resolveSeriesForPlayer(forceRefresh = false): Promise<void> {
-  if (!isPlayerOpen()) {
-    uiStatus = 'initialized';
-    uiDetail = 'Waiting for player';
-    publishState();
+  if (active?.titleId) {
+    selectedGti = active.titleId;
+    selectedEpisode = info.episodeName || active.name;
     return;
   }
 
-  const ok = await ensureConfigsLoaded(forceRefresh);
-  if (!ok) return;
-
-  const series = findSeriesCandidates(
-    titleConfigs,
-    location.href,
-    document.title
-  );
-
-  if (!series || series.candidates.length === 0) {
-    clearMatch('no series candidates');
-    uiStatus = 'title_not_matched';
-    uiDetail = 'No SCF titles matched this player';
-    publishState();
-    return;
+  if (info.gti) {
+    selectedGti = info.gti;
+  } else if (catalog.playingGti) {
+    selectedGti = catalog.playingGti;
   }
 
-  if (
-    activeSeries?.seriesKey === series.seriesKey &&
-    matchedConfig &&
-    series.candidates.some((c) => c.titleId === matchedConfig?.titleId)
-  ) {
-    activeSeries = series;
-    const fresh = series.candidates.find(
-      (c) => c.titleId === matchedConfig?.titleId
+  if (info.episodeName) {
+    selectedEpisode = info.episodeName;
+  } else if (selectedEpisode) {
+    const stillThere = info.episodes.some(
+      (e) => e.name.toLowerCase() === selectedEpisode!.toLowerCase()
     );
-    if (
-      fresh &&
-      JSON.stringify(fresh.filters) !== JSON.stringify(matchedConfig.filters)
-    ) {
-      applySelectedConfig(fresh);
+    if (!stillThere) selectedEpisode = null;
+  }
+}
+
+function refreshDetectedTitle(force = false): void {
+  if (contextInvalidated) return;
+
+  const playerOpen = isPlayerOpen();
+  const pageKey = pageKeyFromUrl();
+
+  if (lastPlayerOpen && !playerOpen) {
+    clearPlaybackCatalog('player_closed');
+    selectedGti = null;
+    selectedEpisode = null;
+    lastFingerprint = '';
+    lastPlayerOpen = false;
+    force = true;
+  } else if (!lastPlayerOpen && playerOpen) {
+    // New watch session — drop previous playing identity; keep detail episode list
+    selectedGti = null;
+    selectedEpisode = null;
+    lastFingerprint = '';
+    lastPlayerOpen = true;
+    force = true;
+  } else {
+    lastPlayerOpen = playerOpen;
+  }
+
+  if (lastPageKey && pageKey !== lastPageKey) {
+    resetPrimeCatalog(pageKey);
+    resetSelection('page_changed');
+    lastPageKey = pageKey;
+    force = true;
+  } else if (!lastPageKey) {
+    lastPageKey = pageKey;
+  }
+
+  const info = extractPrimePageInfo(location.href, document.title);
+
+  // Prefer live catalog GTI even if extractor title came from DOM
+  const catalog = getPrimeCatalog();
+  if (!info.gti && catalog.playingGti) {
+    info.gti = catalog.playingGti;
+  }
+  if (info.kind === 'show' && !info.episodeName) {
+    const active = info.episodes.find((e) => e.nowPlaying);
+    if (active) info.episodeName = active.name;
+  }
+
+  const fingerprint = JSON.stringify({
+    href: location.href,
+    pageKey,
+    title: info.title,
+    kind: info.kind,
+    episodeName: info.episodeName,
+    gti: info.gti,
+    episodes: info.episodes.map((e) => `${e.titleId || ''}:${e.name}:${e.nowPlaying ? 1 : 0}`),
+    player: playerOpen,
+    catalogAt: catalog.updatedAt,
+  });
+
+  if (!force && fingerprint === lastFingerprint) return;
+
+  lastFingerprint = fingerprint;
+  detected = info;
+  syncSelectionFromCatalog(info);
+
+  if (!info.title || info.title === 'Unknown title') {
+    if (info.gti || selectedGti) {
+      const gti = info.gti || selectedGti!;
+      uiStatus = playerOpen ? 'filtering_active' : 'filters_loaded';
+      uiDetail =
+        info.kind === 'show'
+          ? `${selectedEpisode || 'Episode'} · ${gti}`
+          : `Title · ${gti}`;
+      publishState();
       return;
     }
+    uiStatus = 'title_not_matched';
+    uiDetail = 'Could not read a title from this Prime page yet';
     publishState();
     return;
   }
 
-  presentSeries(series);
-}
-
-async function onVideoChange(video: HTMLVideoElement | null): Promise<void> {
-  if (!video || !isPlayerOpen()) {
-    lastPlayerOpen = false;
-    clearMatch('player closed or video gone');
-    uiStatus = 'initialized';
-    uiDetail = 'Waiting for player';
-    publishState();
-    return;
+  if (info.kind === 'show') {
+    uiStatus = selectedEpisode || selectedGti
+      ? playerOpen
+        ? 'filtering_active'
+        : 'filters_loaded'
+      : 'awaiting_selection';
+    uiDetail = selectedEpisode
+      ? `${info.title} · ${selectedEpisode}`
+      : selectedGti
+        ? `${info.title} · ${selectedGti}`
+        : `${info.title} · select an episode`;
+  } else {
+    selectedEpisode = null;
+    if (info.gti) selectedGti = info.gti;
+    uiStatus = playerOpen ? 'filtering_active' : 'filters_loaded';
+    uiDetail =
+      info.kind === 'movie'
+        ? `Movie · ${info.title}`
+        : `Title · ${info.title}`;
   }
 
-  const openedJustNow = !lastPlayerOpen;
-  lastPlayerOpen = true;
-  uiStatus = matchedConfig ? 'filtering_active' : 'video_detected';
-  uiDetail = describeVideo(video);
   publishState();
-
-  const hrefChanged = location.href !== lastHref;
-  lastHref = location.href;
-
-  if (openedJustNow || hrefChanged || !activeSeries) {
-    await resolveSeriesForPlayer();
-  }
-
-  if (matchedConfig && filterManager.hasConfig()) {
-    filterManager.attachVideo(video);
-  }
-}
-
-function describeVideo(video: HTMLVideoElement): string {
-  const size = `${video.videoWidth || video.clientWidth}×${video.videoHeight || video.clientHeight}`;
-  return `Player open · ${size}`;
 }
 
 function onNavigation(): void {
-  if (location.href === lastHref && matchedConfig && isPlayerOpen()) {
+  const href = location.href;
+  const pageKey = pageKeyFromUrl(href);
+
+  if (href === lastHref && pageKey === lastPageKey) {
+    refreshDetectedTitle();
     return;
   }
 
-  lastHref = '';
-  clearMatch('navigation');
-  void onVideoChange(detector?.getCurrent() ?? null);
+  lastHref = href;
+  lastPageKey = pageKey;
+  lastPlayerOpen = false;
+  invalidatePlayerGateCache();
+  resetPrimeCatalog(pageKey);
+  resetSelection('navigation');
+  uiStatus = 'initialized';
+  uiDetail = 'Navigated — detecting title…';
+  publishState();
+  refreshDetectedTitle(true);
 }
 
 function watchSpaNavigation(): void {
@@ -336,91 +306,70 @@ function watchSpaNavigation(): void {
   window.addEventListener('popstate', onNavigation);
 }
 
-function startConfigPolling(): void {
-  pollTimer = window.setInterval(() => {
-    void refreshWhilePlayerOpen(true);
-  }, CONFIG_REFRESH_MS);
-}
-
-async function refreshWhilePlayerOpen(forceConfigRefresh = false): Promise<void> {
-  if (contextInvalidated || !isExtensionContextValid()) {
-    handleContextInvalidated();
-    return;
-  }
-
-  const playerOpen = isPlayerOpen();
-  if (!playerOpen) {
-    if (lastPlayerOpen) {
-      clearMatch('player closed');
-      uiStatus = 'initialized';
-      uiDetail = 'Waiting for player';
-      publishState();
-    }
-    lastPlayerOpen = false;
-    return;
-  }
-
-  lastPlayerOpen = true;
-  await resolveSeriesForPlayer(forceConfigRefresh);
-}
-
-function watchPlayerGate(): void {
-  window.setInterval(() => {
-    const open = isPlayerOpen();
-    if (!open) {
-      if (lastPlayerOpen) {
-        clearMatch('player closed');
-        uiStatus = 'initialized';
-        uiDetail = 'Waiting for player';
-        publishState();
-      }
-      lastPlayerOpen = false;
-      return;
-    }
-
-    if (!lastPlayerOpen) {
-      lastPlayerOpen = true;
-      void onVideoChange(detector?.getCurrent() ?? null);
-    }
-  }, 2000);
+function listenForPrimeNetwork(): void {
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (!applyPrimeNetworkMessage(event.data)) return;
+    // applyPrimeNetworkMessage already notifies catalog subscribers
+  });
+  // Single refresh path — avoid double extract on every network hit
+  subscribePrimeCatalog(() => {
+    refreshDetectedTitle(true);
+  });
 }
 
 function listenForSidePanelMessages(): void {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'SCF_PANEL_VISIBILITY') {
       sidePanelOpen = Boolean(message.sidePanelOpen);
-      if (message.state?.status) {
-        // keep local status from content authority; only sync visibility
-      }
       syncStatusDot();
       sendResponse({ ok: true });
       return false;
     }
 
-    if (message?.type !== 'SCF_SELECT_TITLE' || typeof message.titleId !== 'string') {
+    if (message?.type === 'SCF_GET_PLAYBACK_TIME') {
+      const t = readPlaybackTime();
+      if (t == null) {
+        sendResponse({
+          ok: false,
+          error: 'Player is not open — start playback first',
+        });
+      } else {
+        sendResponse({ ok: true, currentTime: t });
+      }
       return false;
     }
 
-    const config =
-      activeSeries?.candidates.find((c) => c.titleId === message.titleId) ||
-      titleConfigs.find((c) => c.titleId === message.titleId);
+    if (
+      message?.type === 'SCF_SELECT_EPISODE' &&
+      typeof message.episodeName === 'string'
+    ) {
+      selectedEpisode = message.episodeName;
+      const fromCatalog =
+        (typeof message.gti === 'string' && findCatalogEpisode(message.gti)) ||
+        findCatalogEpisode(message.episodeName);
+      selectedGti =
+        fromCatalog?.titleId ||
+        (typeof message.gti === 'string' ? message.gti : selectedGti);
 
-    if (!config) {
-      sendResponse({ ok: false, error: 'Unknown titleId' });
+      if (detected) {
+        detected = {
+          ...detected,
+          episodeName: message.episodeName,
+          gti: selectedGti || detected.gti,
+          kind: 'show',
+        };
+      }
+      const playing = isPlayerOpen();
+      uiStatus = playing ? 'filtering_active' : 'filters_loaded';
+      uiDetail = detected
+        ? `${detected.title} · ${message.episodeName}`
+        : message.episodeName;
+      publishState();
+      sendResponse({ ok: true });
       return false;
     }
 
-    if (!activeSeries) {
-      activeSeries = {
-        seriesKey: `manual:${config.titleId}`,
-        seriesLabel: config.title,
-        reasons: ['selected from side panel'],
-        candidates: [config],
-      };
-    }
-
-    applySelectedConfig(config);
-    sendResponse({ ok: true });
     return false;
   });
 }
@@ -431,20 +380,34 @@ function init(): void {
   syncStatusDot();
 
   uiStatus = 'initialized';
-  uiDetail = 'Waiting for player — open the SCF side panel';
+  uiDetail = 'Open a movie or show on Prime Video';
   publishState();
   logger.info('SCF content script starting on', location.href);
 
-  detector = new VideoDetector((video) => {
-    void onVideoChange(video);
+  detector = new VideoDetector(() => {
+    refreshDetectedTitle(true);
   });
   detector.start();
+
+  listenForPrimeNetwork();
   watchSpaNavigation();
-  startConfigPolling();
-  watchPlayerGate();
   listenForSidePanelMessages();
 
-  void ensureConfigsLoaded();
+  lastHref = location.href;
+  lastPageKey = pageKeyFromUrl();
+  lastPlayerOpen = isPlayerOpen();
+  resetPrimeCatalog(lastPageKey);
+  refreshDetectedTitle(true);
+
+  window.setInterval(() => {
+    if (!contextInvalidated) refreshDetectedTitle();
+  }, REFRESH_MS);
+
+  // Light tick for side-panel clock only — no title re-extract
+  window.setInterval(() => {
+    if (contextInvalidated || !sidePanelOpen || !isPlayerOpen()) return;
+    publishState();
+  }, PLAYBACK_TICK_MS);
 }
 
 init();

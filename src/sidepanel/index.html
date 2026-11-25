@@ -18,28 +18,65 @@
       <div id="status-pill" class="pill pill-neutral">Waiting</div>
     </header>
 
-    <section class="card" id="player-card">
-      <h2>Player</h2>
-      <p id="player-detail" class="muted">Open a Prime Video title and press play.</p>
+    <section class="card" id="detected-card">
+      <h2>On Prime now</h2>
+      <p id="detected-kind" class="muted">Open a movie or show on Prime Video.</p>
+      <p id="detected-title" class="active-title" hidden></p>
+      <p id="detected-meta" class="muted" hidden></p>
     </section>
 
-    <section class="card" id="series-card" hidden>
-      <h2 id="series-label">Series</h2>
-      <p id="series-detail" class="muted"></p>
-      <div id="candidate-list" class="list"></div>
+    <section class="card" id="episodes-card" hidden>
+      <h2>Episodes on this page</h2>
+      <p id="episodes-detail" class="muted"></p>
+      <div id="episode-list" class="list"></div>
     </section>
 
-    <section class="card" id="active-card" hidden>
-      <h2>Active filters</h2>
-      <p id="active-title" class="active-title"></p>
-      <p id="active-meta" class="muted"></p>
-      <ul id="active-filters" class="filters"></ul>
+    <section class="card" id="mark-card" hidden>
+      <h2>Set timestamps</h2>
+      <p id="mark-hint" class="muted">
+        Open the player, then mark start and end for a mute or skip section.
+      </p>
+      <p id="mark-clock" class="clock">--:--</p>
+      <div class="mark-row">
+        <button type="button" id="btn-mark-start" class="btn">Mark start</button>
+        <button type="button" id="btn-mark-end" class="btn">Mark end</button>
+      </div>
+      <div class="mark-bounds">
+        <span id="mark-start-label">Start: —</span>
+        <span id="mark-end-label">End: —</span>
+      </div>
+      <div class="mark-row">
+        <label class="action-pick">
+          <input type="radio" name="filter-action" value="mute" checked />
+          Mute
+        </label>
+        <label class="action-pick">
+          <input type="radio" name="filter-action" value="skip" />
+          Skip
+        </label>
+      </div>
+      <input
+        id="mark-label"
+        class="text-input"
+        type="text"
+        maxlength="80"
+        placeholder="Optional label (e.g. swearing)"
+      />
+      <button type="button" id="btn-save-filter" class="btn btn-primary" disabled>
+        Save filter
+      </button>
+      <p id="mark-status" class="muted mark-status" hidden></p>
+    </section>
+
+    <section class="card" id="saved-card" hidden>
+      <h2>Saved filters</h2>
+      <ul id="saved-list" class="filters"></ul>
     </section>
 
     <footer class="footer">
       <p class="muted">
-        Click the SCF icon to open this side panel anytime. Filters apply only
-        while the Prime player is open.
+        Mark timestamps while the player is running. Filters are saved to the
+        SCF backend for this title or episode.
       </p>
     </footer>
 

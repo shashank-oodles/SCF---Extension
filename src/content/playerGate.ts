@@ -1,40 +1,89 @@
 import { pickActiveVideo } from './videoDetector';
+import {
+  findWatchPlayerVideo,
+  WATCH_PLAYER_ROOT_SELECTOR,
+} from './playbackVideo';
+
+export { findWatchPlayerVideo, WATCH_PLAYER_ROOT_SELECTOR } from './playbackVideo';
+
+let cachedOpen: { at: number; value: boolean } | null = null;
+const CACHE_MS = 250;
 
 /**
- * True only when the Prime Video playback UI / active player video is open.
- * Detail pages (episode lists, trailers) should not run title matching.
+ * True only when the full Prime Video watch player is open.
+ * Detail-page hero trailers / glimpses must return false.
+ *
+ * Kept cheap: no full-document button scans or elementFromPoint.
+ * Result is cached briefly so timers/polls don't thrash layout.
  */
 export function isPlayerOpen(): boolean {
-  const playerChrome = document.querySelector(
-    [
-      '.atvwebplayersdk-infobar-container',
-      '.atvwebplayersdk-title-text',
-      '.atvwebplayersdk-subtitle-text',
-      '.atvwebplayersdk-player-container',
-      '.webPlayerSDKContainer',
-      '#dv-web-player',
-      '.dv-player-container',
-      '[class*="atvwebplayersdk-"]',
-    ].join(', ')
-  );
+  const now = Date.now();
+  if (cachedOpen && now - cachedOpen.at < CACHE_MS) {
+    return cachedOpen.value;
+  }
 
-  const video = pickActiveVideo();
+  const value = computePlayerOpen();
+  cachedOpen = { at: now, value };
+  return value;
+}
+
+export function invalidatePlayerGateCache(): void {
+  cachedOpen = null;
+}
+
+function computePlayerOpen(): boolean {
+  // Fast path: watch-player chrome / root present
+  if (!hasWatchPlayerSignals() && !isLargePlayerRoot()) {
+    return false;
+  }
+
+  const video = getPrimaryPlaybackVideo();
   if (!video) return false;
 
   const rect = video.getBoundingClientRect();
-  const largeEnough = rect.width >= 300 && rect.height >= 160;
-  if (!largeEnough) return false;
+  if (rect.width < 360 || rect.height < 200) return false;
 
-  const hasPlaybackSignal =
-    !video.paused ||
-    video.currentTime > 0.4 ||
-    video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
+  return true;
+}
 
-  // Prefer real player chrome when present; otherwise require a substantial video.
-  if (playerChrome) return hasPlaybackSignal;
+/**
+ * The video element to read/seek/mute — always prefer the watch-player
+ * video over background trailers/glimpses (which keep playing when paused).
+ */
+export function getPrimaryPlaybackVideo(): HTMLVideoElement | null {
+  return findWatchPlayerVideo() ?? pickActiveVideo();
+}
 
-  // Fallback: big video that is clearly in playback (not a tiny preview tile)
-  return hasPlaybackSignal && rect.width >= 480;
+function hasWatchPlayerSignals(): boolean {
+  return Boolean(
+    document.querySelector(
+      [
+        '.atvwebplayersdk-title-text',
+        '.atvwebplayersdk-subtitle-text',
+        '.atvwebplayersdk-infobar-container',
+        '.atvwebplayersdk-seekbar-container',
+        '.atvwebplayersdk-playpause-button',
+        '.atvwebplayersdk-overlays-container',
+        '#dv-web-player',
+        '.webPlayerSDKContainer',
+        'button[aria-label="Close player"]',
+      ].join(', ')
+    )
+  );
+}
+
+function isLargePlayerRoot(): boolean {
+  const roots = document.querySelectorAll(WATCH_PLAYER_ROOT_SELECTOR);
+
+  for (const root of Array.from(roots)) {
+    if (!(root instanceof HTMLElement)) continue;
+    const rect = root.getBoundingClientRect();
+    const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+    const viewport = window.innerWidth * window.innerHeight;
+    if (viewport > 0 && area >= viewport * 0.4) return true;
+    if (rect.width >= 640 && rect.height >= 360) return true;
+  }
+  return false;
 }
 
 export function describePlayerGate(): string {

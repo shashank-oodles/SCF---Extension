@@ -14,9 +14,32 @@ export interface TitleFilterConfig {
   title: string;
   kind?: TitleKind;
   episodeName?: string;
+  /** Amazon Prime GTI (amzn1.dv.gti.…); preferred match key */
+  gti?: string;
   provider: 'prime-video';
   videoUrl?: string;
   matchPatterns: string[];
+  filters: FilterInterval[];
+}
+
+export interface CreateTitleRequest {
+  title: string;
+  kind: TitleKind;
+  episodeName?: string;
+  /** Required Amazon GTI (amzn1.dv.gti.…) */
+  gti: string;
+  videoUrl: string;
+  provider?: 'prime-video';
+  matchPatterns?: string[];
+}
+
+export interface PublishTitleRequest {
+  title?: string;
+  kind?: TitleKind;
+  episodeName?: string;
+  gti?: string;
+  videoUrl?: string;
+  matchPatterns?: string[];
   filters: FilterInterval[];
 }
 

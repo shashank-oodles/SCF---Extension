@@ -1,5 +1,13 @@
-import type { ApiSuccessResponse, TitleFilterConfig } from '../types';
+import type {
+  ApiSuccessResponse,
+  CreateTitleRequest,
+  FilterInterval,
+  PublishTitleRequest,
+  TitleFilterConfig,
+} from '../types';
+import { extractAmazonGti, isAmazonGti, normalizeGti } from '../utils/gti';
 import { validateTitleFilterConfig } from '../utils/validateConfig';
+import { getPrimeCatalog } from './primeCatalog';
 import { logger } from '../utils/logger';
 
 interface ProxyResponse {
@@ -8,6 +16,8 @@ interface ProxyResponse {
   body: unknown;
   error?: string;
 }
+
+type ApiMethod = 'GET' | 'POST' | 'PUT';
 
 export class ExtensionContextInvalidatedError extends Error {
   constructor(message = 'Extension was reloaded. Refresh this Prime Video tab.') {
@@ -35,17 +45,25 @@ function isContextInvalidatedError(err: unknown): boolean {
  * script is blocked by Chrome when the page origin is public (primevideo.com)
  * and the target is loopback (localhost).
  */
-async function getJson<T>(path: string): Promise<T> {
+async function requestJson<T>(
+  path: string,
+  method: ApiMethod = 'GET',
+  body?: unknown
+): Promise<T> {
   if (!isExtensionContextValid()) {
     throw new ExtensionContextInvalidatedError();
   }
+
+  const messageType =
+    method === 'POST' ? 'API_POST' : method === 'PUT' ? 'API_PUT' : 'API_GET';
 
   let result: ProxyResponse;
 
   try {
     result = (await chrome.runtime.sendMessage({
-      type: 'API_GET',
+      type: messageType,
       path,
+      body,
     })) as ProxyResponse;
   } catch (err) {
     if (isContextInvalidatedError(err)) {
@@ -80,19 +98,30 @@ async function getJson<T>(path: string): Promise<T> {
     );
   }
 
-  const body = result.body as
+  const responseBody = result.body as
     | ApiSuccessResponse<T>
     | { success: false; message: string };
 
-  if (!body || typeof body !== 'object' || !('success' in body) || !body.success) {
+  if (
+    !responseBody ||
+    typeof responseBody !== 'object' ||
+    !('success' in responseBody) ||
+    !responseBody.success
+  ) {
     const message =
-      body && 'message' in body && typeof body.message === 'string'
-        ? body.message
+      responseBody &&
+      'message' in responseBody &&
+      typeof responseBody.message === 'string'
+        ? responseBody.message
         : 'Invalid API response';
     throw new Error(message);
   }
 
-  return (body as ApiSuccessResponse<T>).data;
+  return (responseBody as ApiSuccessResponse<T>).data;
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  return requestJson<T>(path, 'GET');
 }
 
 export async function fetchAllTitleConfigs(): Promise<TitleFilterConfig[]> {
@@ -126,6 +155,97 @@ export async function resolveFiltersByQuery(
   }
 
   return data;
+}
+
+/** Resolve by query; returns null when nothing matches (404). */
+export async function tryResolveFiltersByQuery(
+  query: string
+): Promise<TitleFilterConfig | null> {
+  try {
+    return await resolveFiltersByQuery(query);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/no matching title|404|not found/i.test(message)) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function createTitleConfig(
+  input: CreateTitleRequest
+): Promise<TitleFilterConfig> {
+  const data = await requestJson<TitleFilterConfig>('/filters', 'POST', input);
+  if (!validateTitleFilterConfig(data)) {
+    throw new Error('Created title failed validation');
+  }
+  return data;
+}
+
+export async function publishTitleFilters(
+  titleId: string,
+  input: PublishTitleRequest
+): Promise<TitleFilterConfig> {
+  const data = await requestJson<TitleFilterConfig>(
+    `/filters/${encodeURIComponent(titleId)}`,
+    'PUT',
+    input
+  );
+  if (!validateTitleFilterConfig(data)) {
+    throw new Error('Published filters failed validation');
+  }
+  return data;
+}
+
+/**
+ * Ensure a backend title exists for this movie/episode, then append filters.
+ * Identity is Amazon GTI only.
+ */
+export async function appendFiltersForTitle(options: {
+  title: string;
+  kind: 'movie' | 'show';
+  episodeName?: string;
+  gti: string;
+  videoUrl?: string;
+  filters: FilterInterval[];
+}): Promise<TitleFilterConfig> {
+  const { title, kind, episodeName, gti, filters } = options;
+  const videoUrl = options.videoUrl || `gti://${gti}`;
+
+  if (!/amzn1\.dv\.gti\./i.test(gti)) {
+    throw new Error('Amazon GTI is required to save filters');
+  }
+
+  let config = await tryResolveFiltersByQuery(gti);
+
+  if (!config) {
+    config = await createTitleConfig({
+      title,
+      kind,
+      episodeName: kind === 'show' ? episodeName : undefined,
+      gti,
+      videoUrl,
+      provider: 'prime-video',
+      matchPatterns: [gti],
+    });
+  }
+
+  const mergedPatterns = [
+    ...new Set(
+      [...config.matchPatterns, gti].filter((p) => /amzn1\.dv\.gti\./i.test(p))
+    ),
+  ];
+
+  const merged = [...config.filters, ...filters];
+  return publishTitleFilters(config.titleId, {
+    title,
+    kind,
+    episodeName: kind === 'show' ? episodeName : undefined,
+    gti,
+    videoUrl,
+    matchPatterns: mergedPatterns,
+    filters: merged,
+  });
 }
 
 function readText(selector: string): string {
@@ -251,16 +371,22 @@ function episodeAppearsSelected(episodeName: string): boolean {
   return false;
 }
 
-function explainScore(
-  config: TitleFilterConfig,
-  priority: string,
-  haystack: string
-): MatchCandidateDebug {
-  const matchedPatterns = matchedPatternsFor(config, haystack);
-  const reasons: string[] = [];
-  let score = 0;
+function configIdentityGti(config: TitleFilterConfig): string | undefined {
+  if (config.gti && isAmazonGti(config.gti)) return config.gti;
+  for (const pattern of config.matchPatterns) {
+    const gti = extractAmazonGti(pattern);
+    if (gti) return gti;
+  }
+  return undefined;
+}
 
-  if (matchedPatterns.length === 0) {
+function explainGtiScore(
+  config: TitleFilterConfig,
+  liveGtis: Set<string>,
+  playingGti?: string
+): MatchCandidateDebug {
+  const gti = configIdentityGti(config);
+  if (!gti) {
     return {
       titleId: config.titleId,
       title: config.title,
@@ -268,103 +394,67 @@ function explainScore(
       episodeName: config.episodeName,
       score: 0,
       matchedPatterns: [],
-      reasons: ['no matchPatterns found in page text/url'],
+      reasons: ['no Amazon GTI on config'],
     };
   }
 
-  if (config.kind === 'show' && config.episodeName?.trim()) {
-    const episode = config.episodeName.trim().toLowerCase();
-    const inBody = haystack.includes(episode);
-    const inPriority = priority.includes(episode);
-    const selected = episodeAppearsSelected(config.episodeName);
-
-    if (!inBody) {
-      return {
-        titleId: config.titleId,
-        title: config.title,
-        kind: config.kind,
-        episodeName: config.episodeName,
-        score: 0,
-        matchedPatterns,
-        reasons: [
-          `episodeName "${config.episodeName}" not found on page`,
-          `patterns that did hit: ${matchedPatterns.join(' | ')}`,
-        ],
-      };
-    }
-
-    score = 10;
-    reasons.push('episodeName found on page (+10)');
-    reasons.push(`patterns hit: ${matchedPatterns.join(' | ')}`);
-
-    if (selected) {
-      score += 2000;
-      reasons.push('episode appears on a selected/active row (+2000)');
-    }
-    if (inPriority) {
-      score += 1000;
-      reasons.push('episodeName found in priority UI/title/url (+1000)');
-    } else {
-      reasons.push('episodeName only in page body (not in player/title UI)');
-    }
-
-    const tie = Math.min(episode.length, 40) / 100;
-    score += tie;
-    reasons.push(`episode name length tie-break (+${tie.toFixed(2)})`);
-
+  const key = normalizeGti(gti);
+  if (!liveGtis.has(key)) {
     return {
       titleId: config.titleId,
       title: config.title,
       kind: config.kind,
       episodeName: config.episodeName,
-      score,
-      matchedPatterns,
-      reasons,
+      score: 0,
+      matchedPatterns: [],
+      reasons: [`GTI ${gti} not in live catalog`],
     };
   }
 
-  score = 20;
-  reasons.push(`patterns hit: ${matchedPatterns.join(' | ')} (+20)`);
-  if (matchedPatternsFor(config, priority).length > 0) {
-    score += 100;
-    reasons.push('pattern also in priority UI/title/url (+100)');
-  }
-
+  const exactPlaying = playingGti && normalizeGti(playingGti) === key;
   return {
     titleId: config.titleId,
     title: config.title,
     kind: config.kind,
     episodeName: config.episodeName,
-    score,
-    matchedPatterns,
-    reasons,
+    score: exactPlaying ? 5000 : 1000,
+    matchedPatterns: [gti],
+    reasons: [
+      exactPlaying
+        ? `exact playing GTI ${gti} (+5000)`
+        : `catalog GTI ${gti} (+1000)`,
+    ],
   };
 }
 
 /**
- * Movies: any matchPattern substring hit is enough.
- * Shows: episodeName must appear somewhere on the page (including body text),
- * plus at least one matchPattern. When several episodes of the same show are
- * listed on the page, prefer the one also present in priority/selected UI text.
+ * Match filters by Amazon GTI only (playing / catalog GTIs).
  */
 export function matchTitleConfig(
   configs: TitleFilterConfig[],
-  pageUrl: string,
-  pageTitle: string,
-  pageText?: string
+  _pageUrl?: string,
+  _pageTitle?: string,
+  _pageText?: string
 ): TitleFilterConfig | undefined {
-  const priority = collectPriorityMatchText(pageUrl, pageTitle).toLowerCase();
-  const haystack = (pageText ?? collectPageMatchText(pageUrl, pageTitle)).toLowerCase();
+  const catalog = getPrimeCatalog();
+  const liveGtis = new Set<string>();
+  if (catalog.playingGti) liveGtis.add(normalizeGti(catalog.playingGti));
+  if (catalog.focusEpisodeId) liveGtis.add(normalizeGti(catalog.focusEpisodeId));
+  if (catalog.parentGti) liveGtis.add(normalizeGti(catalog.parentGti));
+  for (const g of catalog.gtis) liveGtis.add(normalizeGti(g));
+  for (const ep of catalog.episodes) liveGtis.add(normalizeGti(ep.titleId));
 
-  const evaluated = configs.map((config) => explainScore(config, priority, haystack));
+  const evaluated = configs.map((config) =>
+    explainGtiScore(config, liveGtis, catalog.playingGti)
+  );
   const ranked = evaluated
     .filter((row) => row.score > 0)
     .sort((a, b) => b.score - a.score);
 
   if (ranked.length === 0) {
-    logger.warn('Title match: no candidates', {
-      href: pageUrl,
-      documentTitle: pageTitle,
+    logger.warn('Title match: no GTI candidates', {
+      liveGtis: [...liveGtis],
+      playingGti: catalog.playingGti,
       rejected: evaluated.map((row) => ({
         titleId: row.titleId,
         episodeName: row.episodeName,
@@ -377,7 +467,7 @@ export function matchTitleConfig(
   const best = ranked[0];
   const winnerConfig = configs.find((c) => c.titleId === best.titleId);
 
-  logger.info('Title match decision', {
+  logger.info('Title match decision (GTI-only)', {
     winner: {
       titleId: best.titleId,
       title: best.title,
@@ -387,28 +477,9 @@ export function matchTitleConfig(
       matchedPatterns: best.matchedPatterns,
       reasons: best.reasons,
     },
-    allCandidates: ranked.map((row) => ({
-      titleId: row.titleId,
-      episodeName: row.episodeName,
-      score: Number(row.score.toFixed(2)),
-      matchedPatterns: row.matchedPatterns,
-      reasons: row.reasons,
-    })),
-    page: {
-      href: pageUrl,
-      documentTitle: pageTitle,
-      priorityPreview: priority.slice(0, 240),
-    },
+    liveGtis: [...liveGtis],
+    playingGti: catalog.playingGti,
   });
-
-  if (ranked.length > 1 && ranked[1].score >= best.score - 0.5) {
-    logger.warn('Title match is close / possibly wrong', {
-      winnerId: best.titleId,
-      runnerUpId: ranked[1].titleId,
-      winnerScore: best.score,
-      runnerUpScore: ranked[1].score,
-    });
-  }
 
   return winnerConfig;
 }

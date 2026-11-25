@@ -110,6 +110,16 @@ const contentBuild = {
   define,
 };
 
+const networkHookBuild = {
+  entryPoints: [join(root, 'src/content/primeNetworkHook.ts')],
+  bundle: true,
+  outfile: join(dist, 'content/primeNetworkHook.js'),
+  format: 'iife',
+  target: ['chrome110'],
+  sourcemap: true,
+  logLevel: 'info',
+};
+
 const backgroundBuild = {
   entryPoints: [join(root, 'src/background/serviceWorker.ts')],
   bundle: true,
@@ -137,6 +147,7 @@ copyStatic();
 async function buildOnce() {
   await Promise.all([
     esbuild.build(contentBuild),
+    esbuild.build(networkHookBuild),
     esbuild.build(backgroundBuild),
     esbuild.build(sidepanelBuild),
   ]);
@@ -147,10 +158,12 @@ async function buildOnce() {
 
 if (watch) {
   const ctxContent = await esbuild.context(contentBuild);
+  const ctxHook = await esbuild.context(networkHookBuild);
   const ctxBg = await esbuild.context(backgroundBuild);
   const ctxSide = await esbuild.context(sidepanelBuild);
   await Promise.all([
     ctxContent.watch(),
+    ctxHook.watch(),
     ctxBg.watch(),
     ctxSide.watch(),
   ]);

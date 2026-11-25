@@ -1,24 +1,48 @@
-import type { ExtensionStatus, FilterInterval } from './index';
+import type { ExtensionStatus } from './index';
+import type { PrimeKind } from '../services/primeTitleExtractor';
 
-export interface SidePanelCandidate {
-  titleId: string;
-  title: string;
-  kind?: string;
-  episodeName?: string;
-  filterCount: number;
-  filters: FilterInterval[];
+export interface SidePanelEpisode {
+  name: string;
+  label?: string;
+  titleId?: string;
+  nowPlaying?: boolean;
 }
 
+/** What the side panel displays — extracted from Prime, not backend matching. */
 export interface SidePanelState {
   playerOpen: boolean;
-  /** True while the SCF Chrome side panel page is connected */
   sidePanelOpen?: boolean;
   status: ExtensionStatus;
   statusDetail?: string;
-  seriesLabel?: string | null;
-  seriesKey?: string | null;
-  reasons?: string[];
-  candidates: SidePanelCandidate[];
-  selectedId?: string | null;
+
+  /** Extracted from the Prime page */
+  detected?: {
+    kind: PrimeKind;
+    title: string;
+    episodeName?: string;
+    seasonLabel?: string;
+    /** Playing title GTI from Sonar / playerChromeResources */
+    gti?: string;
+    parentGti?: string;
+    pageUrl?: string;
+    episodes: SidePanelEpisode[];
+    sources: string[];
+  } | null;
+
+  selectedEpisode?: string | null;
+  selectedGti?: string | null;
+
+  /** Live player clock (seconds) when player is open */
+  currentTime?: number | null;
+
+  /** Saved filters for the active title/episode (from backend) */
+  savedFilters?: Array<{
+    id: string;
+    start: number;
+    end: number;
+    action: 'mute' | 'skip';
+    label?: string;
+  }> | null;
+
   updatedAt: number;
 }

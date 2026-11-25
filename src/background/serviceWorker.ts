@@ -15,9 +15,9 @@ let latestState: SidePanelState = {
   playerOpen: false,
   sidePanelOpen: false,
   status: 'initialized',
-  statusDetail: 'Open Prime Video and press play',
-  candidates: [],
-  selectedId: null,
+  statusDetail: 'Open a movie or show on Prime Video',
+  detected: null,
+  selectedEpisode: null,
   updatedAt: Date.now(),
 };
 
@@ -37,7 +37,10 @@ async function resolveApiBase(): Promise<string> {
   return BUILD_API_BASE.replace(/\/$/, '');
 }
 
-async function proxyApiGet(path: string): Promise<{
+async function proxyApi(
+  path: string,
+  options: { method?: string; body?: unknown } = {}
+): Promise<{
   ok: boolean;
   status: number;
   body: unknown;
@@ -46,12 +49,18 @@ async function proxyApiGet(path: string): Promise<{
   const base = await resolveApiBase();
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   const url = `${base}${normalizedPath}`;
+  const method = (options.method || 'GET').toUpperCase();
 
   try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-    });
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    const init: RequestInit = { method, headers };
+
+    if (options.body !== undefined && method !== 'GET' && method !== 'HEAD') {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(options.body);
+    }
+
+    const response = await fetch(url, init);
 
     let body: unknown;
     try {
@@ -155,8 +164,52 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === 'API_GET' && typeof message.path === 'string') {
-    void proxyApiGet(message.path).then((result) => sendResponse(result));
+  if (
+    (message?.type === 'API_GET' ||
+      message?.type === 'API_POST' ||
+      message?.type === 'API_PUT') &&
+    typeof message.path === 'string'
+  ) {
+    const method =
+      message.type === 'API_POST'
+        ? 'POST'
+        : message.type === 'API_PUT'
+          ? 'PUT'
+          : 'GET';
+    void proxyApi(message.path, { method, body: message.body }).then((result) =>
+      sendResponse(result)
+    );
+    return true;
+  }
+
+  if (message?.type === 'SCF_GET_PLAYBACK_TIME') {
+    const deliver = async () => {
+      let tabId = activeTabId;
+      if (tabId == null) {
+        const tabs = await chrome.tabs.query({
+          active: true,
+          currentWindow: true,
+        });
+        tabId = tabs[0]?.id ?? null;
+      }
+      if (tabId == null) {
+        return { ok: false, error: 'No active Prime Video tab' };
+      }
+      try {
+        return (await chrome.tabs.sendMessage(tabId, {
+          type: 'SCF_GET_PLAYBACK_TIME',
+        })) as { ok: boolean; currentTime?: number; error?: string };
+      } catch (err) {
+        return {
+          ok: false,
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Prime Video tab unavailable. Refresh the page.',
+        };
+      }
+    };
+    void deliver().then((result) => sendResponse(result));
     return true;
   }
 
@@ -195,8 +248,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === 'SCF_SELECT_TITLE' && typeof message.titleId === 'string') {
-    const titleId = message.titleId;
+  if (
+    (message?.type === 'SCF_SELECT_TITLE' && typeof message.titleId === 'string') ||
+    (message?.type === 'SCF_SELECT_EPISODE' && typeof message.episodeName === 'string')
+  ) {
+    const payload =
+      message.type === 'SCF_SELECT_EPISODE'
+        ? {
+            type: 'SCF_SELECT_EPISODE',
+            episodeName: message.episodeName,
+            ...(typeof message.gti === 'string' ? { gti: message.gti } : {}),
+          }
+        : { type: 'SCF_SELECT_TITLE', titleId: message.titleId };
 
     const deliver = async () => {
       let tabId = activeTabId;
@@ -212,10 +275,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       try {
-        await chrome.tabs.sendMessage(tabId, {
-          type: 'SCF_SELECT_TITLE',
-          titleId,
-        });
+        await chrome.tabs.sendMessage(tabId, payload);
         return { ok: true };
       } catch (err) {
         logger.error('Failed to deliver selection to tab', err);
