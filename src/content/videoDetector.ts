@@ -75,7 +75,6 @@ export function pickActiveVideo(
 }
 
 export class VideoDetector {
-  private observer: MutationObserver | null = null;
   private pollId: number | null = null;
   private debounceId: number | null = null;
   private current: HTMLVideoElement | null = null;
@@ -90,27 +89,19 @@ export class VideoDetector {
   start(): void {
     this.scan();
 
-    // Debounce: Prime mutates the DOM constantly during load; scanning on
-    // every mutation stalls the main thread.
-    this.observer = new MutationObserver(() => {
-      if (this.debounceId !== null) return;
-      this.debounceId = window.setTimeout(() => {
-        this.debounceId = null;
-        this.scan();
-      }, 400);
-    });
-    this.observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-    });
+    // No document-wide MutationObserver: Prime mutates the DOM constantly and
+    // observing the whole subtree costs CPU on every batch. A <video> appearing
+    // also fires a capturing `loadedmetadata`, which is enough to react quickly.
+    document.addEventListener('loadedmetadata', this.onMediaEvent, true);
+    document.addEventListener('play', this.onMediaEvent, true);
 
     this.pollId = window.setInterval(() => this.scan(), this.pollMs);
     logger.info('VideoDetector started');
   }
 
   stop(): void {
-    this.observer?.disconnect();
-    this.observer = null;
+    document.removeEventListener('loadedmetadata', this.onMediaEvent, true);
+    document.removeEventListener('play', this.onMediaEvent, true);
     if (this.pollId !== null) {
       window.clearInterval(this.pollId);
       this.pollId = null;
@@ -121,6 +112,15 @@ export class VideoDetector {
     }
     this.current = null;
   }
+
+  private readonly onMediaEvent = (event: Event): void => {
+    if (!(event.target instanceof HTMLVideoElement)) return;
+    if (this.debounceId !== null) return;
+    this.debounceId = window.setTimeout(() => {
+      this.debounceId = null;
+      this.scan();
+    }, 250);
+  };
 
   getCurrent(): HTMLVideoElement | null {
     return this.current ?? pickActiveVideo();

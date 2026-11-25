@@ -130,6 +130,22 @@ function markNowPlaying(
   }));
 }
 
+function catalogSignature(snapshot: PrimeCatalogSnapshot): string {
+  return JSON.stringify([
+    snapshot.contentKind,
+    snapshot.playingGti,
+    snapshot.focusEpisodeId,
+    snapshot.parentGti,
+    snapshot.seriesTitle,
+    snapshot.movieTitle,
+    snapshot.episodeTitle,
+    snapshot.seasonNumber,
+    snapshot.episodeNumber,
+    snapshot.pageKey,
+    snapshot.episodes.map((e) => `${e.titleId}:${e.name}:${e.nowPlaying ? 1 : 0}`),
+  ]);
+}
+
 export function applyPrimeNetworkMessage(data: unknown): boolean {
   if (!data || typeof data !== 'object') return false;
   const msg = data as Record<string, unknown>;
@@ -139,6 +155,22 @@ export function applyPrimeNetworkMessage(data: unknown): boolean {
     return false;
   }
   if (msg.type !== 'catalog') return false;
+
+  const before = catalogSignature(catalog);
+  const changed = applyCatalogMessage(msg);
+  if (!changed || catalogSignature(catalog) === before) return false;
+
+  logger.info('Prime catalog updated', {
+    api: catalog.api,
+    contentKind: catalog.contentKind,
+    playingGti: catalog.playingGti,
+    episodeCount: catalog.episodes.length,
+  });
+  notify();
+  return true;
+}
+
+function applyCatalogMessage(msg: Record<string, unknown>): boolean {
 
   const currentPageKey = pageKeyFromUrl();
   if (catalog.pageKey && catalog.pageKey !== currentPageKey) {
@@ -325,20 +357,6 @@ export function applyPrimeNetworkMessage(data: unknown): boolean {
     ];
   }
 
-  logger.info('Prime catalog updated', {
-    api: catalog.api,
-    contentKind: catalog.contentKind,
-    playingGti: catalog.playingGti,
-    movieTitle: catalog.movieTitle,
-    seriesTitle: catalog.seriesTitle,
-    episodeTitle: catalog.episodeTitle,
-    seasonNumber: catalog.seasonNumber,
-    episodeNumber: catalog.episodeNumber,
-    focusEpisodeId: catalog.focusEpisodeId,
-    episodeCount: catalog.episodes.length,
-  });
-
-  notify();
   return true;
 }
 

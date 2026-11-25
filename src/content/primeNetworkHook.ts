@@ -23,8 +23,18 @@
     nowPlaying?: boolean;
   };
 
+  // Sonar pings repeat every few seconds with the same titleId; only forward changes.
+  const lastSignatureByApi = new Map<string, string>();
+
   function emit(payload: Record<string, unknown>): void {
     try {
+      if (payload.type === 'catalog') {
+        const api = String(payload.api || '');
+        const { url: _url, ...rest } = payload;
+        const signature = JSON.stringify(rest);
+        if (lastSignatureByApi.get(api) === signature) return;
+        lastSignatureByApi.set(api, signature);
+      }
       window.postMessage({ source: SOURCE, ...payload, at: Date.now() }, '*');
     } catch {
       // ignore
@@ -316,7 +326,8 @@
   }
 
   const originalFetch = window.fetch.bind(window);
-  window.fetch = async (...args: Parameters<typeof fetch>) => {
+  // Non-async wrapper so unrelated requests pass straight through.
+  window.fetch = (...args: Parameters<typeof fetch>): Promise<Response> => {
     const input = args[0];
     const init = args[1];
     const url =
@@ -327,13 +338,17 @@
           : input.url;
 
     const kind = classifyUrl(url);
-    // Don't await body before fetch — that stalls Prime's own requests
+    if (!kind) return originalFetch(...args);
+
+    // Read the body in parallel — never delay Prime's own request.
     const requestTextPromise =
       kind === 'sonar' ? readBodyText(input, init) : Promise.resolve(undefined);
 
-    const response = await originalFetch(...args);
-    if (kind) {
-      void Promise.all([requestTextPromise, readResponseClone(response)]).then(
+    return originalFetch(...args).then((response) => {
+      // Sonar identity lives in the request body; skip cloning its response.
+      const responsePromise =
+        kind === 'sonar' ? Promise.resolve(null) : readResponseClone(response);
+      void Promise.all([requestTextPromise, responsePromise]).then(
         ([requestText, text]) => {
           if (!text && !requestText) return;
           try {
@@ -343,8 +358,8 @@
           }
         }
       );
-    }
-    return response;
+      return response;
+    });
   };
 
   const xhrOpen = XMLHttpRequest.prototype.open;
@@ -369,7 +384,14 @@
     if (kind) {
       this.addEventListener('load', function () {
         try {
-          const text = this.responseText;
+          if (kind === 'sonar') {
+            if (requestText) handleJson(url, {}, requestText);
+            return;
+          }
+          const text =
+            this.responseType === '' || this.responseType === 'text'
+              ? this.responseText
+              : '';
           if (!text) {
             if (requestText) handleJson(url, {}, requestText);
             return;
@@ -383,6 +405,25 @@
 
     return xhrSend.call(this, body);
   };
+
+  // Prime's SPA navigation happens in the page world; isolated-world patches
+  // of `history` never see it, so announce URL changes from here.
+  let lastHref = location.href;
+  const announceNavigation = (): void => {
+    if (location.href === lastHref) return;
+    lastHref = location.href;
+    // The new page resets the catalog, so a repeat of the old payload is news.
+    lastSignatureByApi.clear();
+    window.postMessage({ source: SOURCE, type: 'navigation', href: lastHref }, '*');
+  };
+  for (const method of ['pushState', 'replaceState'] as const) {
+    const original = history[method].bind(history);
+    history[method] = (...args: Parameters<History['pushState']>) => {
+      original(...args);
+      announceNavigation();
+    };
+  }
+  window.addEventListener('popstate', announceNavigation);
 
   emit({ type: 'hook_ready' });
 })();

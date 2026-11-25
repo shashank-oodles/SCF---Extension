@@ -43,7 +43,24 @@ function computePlayerOpen(): boolean {
   const rect = video.getBoundingClientRect();
   if (rect.width < 360 || rect.height < 200) return false;
 
-  return true;
+  return isWatchPlayerOnTop(video);
+}
+
+/**
+ * The closed player's DOM lingers and the detail-page hero trailer is also
+ * a large <video>, so presence isn't enough: the full-screen watch player
+ * must be what's rendered at the viewport centre. One hit-test per cache window.
+ */
+function isWatchPlayerOnTop(video: HTMLVideoElement): boolean {
+  const top = document.elementFromPoint(
+    window.innerWidth / 2,
+    window.innerHeight / 2
+  );
+  if (!top) return false;
+  if (top === video || video.contains(top)) {
+    return Boolean(video.closest(WATCH_PLAYER_ROOT_SELECTOR));
+  }
+  return Boolean(top.closest(WATCH_PLAYER_ROOT_SELECTOR));
 }
 
 /**

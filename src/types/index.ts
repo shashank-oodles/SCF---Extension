@@ -73,6 +73,8 @@ export interface PlaybackSnapshot {
   readyState: number;
   ended: boolean;
   waiting: boolean;
+  /** An ad break is playing; filters must not act */
+  adPlaying: boolean;
 }
 
 export type StatusListener = (status: ExtensionStatus, detail?: string) => void;

@@ -89,32 +89,34 @@ function withPanelFlag(state: SidePanelState): SidePanelState {
   };
 }
 
+let lastNotifiedPanelOpen: boolean | null = null;
+
 function broadcastState(state: SidePanelState): void {
   latestState = withPanelFlag(state);
+  if (sidePanelPorts === 0) return;
   void chrome.runtime.sendMessage({ type: 'SCF_STATE', state: latestState }).catch(() => {
     // receivers may be closed
   });
+}
 
-  // Notify content scripts about panel open/close so the status dot can toggle
-  if (activeTabId != null) {
-    void chrome.tabs
-      .sendMessage(activeTabId, {
-        type: 'SCF_PANEL_VISIBILITY',
-        sidePanelOpen: latestState.sidePanelOpen,
-        state: latestState,
-      })
-      .catch(() => {
-        // tab may not have content script
-      });
-  }
+function notifyTabPanelVisibility(open: boolean): void {
+  if (activeTabId == null || lastNotifiedPanelOpen === open) return;
+  lastNotifiedPanelOpen = open;
+  void chrome.tabs
+    .sendMessage(activeTabId, { type: 'SCF_PANEL_VISIBILITY', sidePanelOpen: open })
+    .catch(() => {
+      // tab may not have content script
+    });
 }
 
 function setSidePanelOpen(open: boolean): void {
-  const next = withPanelFlag({
-    ...latestState,
-    sidePanelOpen: open,
-  });
-  broadcastState(next);
+  latestState = withPanelFlag({ ...latestState, sidePanelOpen: open });
+  if (open) {
+    void chrome.runtime
+      .sendMessage({ type: 'SCF_STATE', state: latestState })
+      .catch(() => {});
+  }
+  notifyTabPanelVisibility(open);
   logger.info('Side panel visibility', { open, ports: sidePanelPorts });
 }
 
@@ -135,6 +137,44 @@ chrome.runtime.onInstalled.addListener((details) => {
 void chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
   .catch((err) => logger.warn('sidePanel behavior failed', err));
+
+function resetStateForNavigation(detail: string): void {
+  broadcastState({
+    playerOpen: false,
+    sidePanelOpen: sidePanelPorts > 0,
+    status: 'initialized',
+    statusDetail: detail,
+    detected: null,
+    selectedEpisode: null,
+    selectedGti: null,
+    currentTime: null,
+    updatedAt: Date.now(),
+  });
+}
+
+function detailPageKey(url: string): string {
+  const match = url.match(/\/detail\/([A-Za-z0-9]+)/i);
+  return match ? match[1].toLowerCase() : url.split('?')[0];
+}
+
+// Drop the cached title whenever the Prime tab moves to a different page, so the
+// panel never shows a stale title (e.g. after the content script was invalidated).
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tabId !== activeTabId || !changeInfo.url) return;
+  const previous = latestState.detected?.pageUrl;
+  if (previous && detailPageKey(previous) === detailPageKey(changeInfo.url)) return;
+  resetStateForNavigation(
+    tab.url && /primevideo\.com|amazon\.com/.test(tab.url)
+      ? 'Navigated — detecting title…'
+      : 'Open a movie or show on Prime Video'
+  );
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId !== activeTabId) return;
+  activeTabId = null;
+  resetStateForNavigation('Open a movie or show on Prime Video');
+});
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== PANEL_PORT) return;
@@ -219,11 +259,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === 'SCF_STATE_UPDATE' && message.state) {
-    if (sender.tab?.id != null) {
+    if (sender.tab?.id != null && sender.tab.id !== activeTabId) {
       activeTabId = sender.tab.id;
+      lastNotifiedPanelOpen = null;
     }
     broadcastState(message.state as SidePanelState);
     sendResponse({ ok: true, sidePanelOpen: sidePanelPorts > 0 });
+    return false;
+  }
+
+  if (message?.type === 'SCF_TIME_UPDATE') {
+    latestState = {
+      ...latestState,
+      playerOpen: Boolean(message.playerOpen),
+      currentTime:
+        typeof message.currentTime === 'number' ? message.currentTime : null,
+      adPlaying: Boolean(message.adPlaying),
+    };
+    if (sidePanelPorts > 0) {
+      void chrome.runtime
+        .sendMessage({
+          type: 'SCF_TIME',
+          playerOpen: latestState.playerOpen,
+          currentTime: latestState.currentTime,
+          adPlaying: latestState.adPlaying,
+        })
+        .catch(() => {});
+    }
     return false;
   }
 
@@ -250,7 +312,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (
     (message?.type === 'SCF_SELECT_TITLE' && typeof message.titleId === 'string') ||
-    (message?.type === 'SCF_SELECT_EPISODE' && typeof message.episodeName === 'string')
+    (message?.type === 'SCF_SELECT_EPISODE' && typeof message.episodeName === 'string') ||
+    message?.type === 'SCF_FILTERS_CHANGED'
   ) {
     const payload =
       message.type === 'SCF_SELECT_EPISODE'
@@ -259,7 +322,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             episodeName: message.episodeName,
             ...(typeof message.gti === 'string' ? { gti: message.gti } : {}),
           }
-        : { type: 'SCF_SELECT_TITLE', titleId: message.titleId };
+        : message.type === 'SCF_FILTERS_CHANGED'
+          ? {
+              type: 'SCF_FILTERS_CHANGED',
+              ...(typeof message.gti === 'string' ? { gti: message.gti } : {}),
+            }
+          : { type: 'SCF_SELECT_TITLE', titleId: message.titleId };
 
     const deliver = async () => {
       let tabId = activeTabId;
@@ -278,7 +346,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await chrome.tabs.sendMessage(tabId, payload);
         return { ok: true };
       } catch (err) {
-        logger.error('Failed to deliver selection to tab', err);
+        logger.error('Failed to deliver message to tab', err);
         return {
           ok: false,
           error: 'Prime Video tab unavailable. Refresh the page.',

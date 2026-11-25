@@ -26,24 +26,41 @@
     </section>
 
     <section class="card" id="episodes-card" hidden>
-      <h2>Episodes on this page</h2>
+      <h2>Episodes</h2>
       <p id="episodes-detail" class="muted"></p>
       <div id="episode-list" class="list"></div>
     </section>
 
     <section class="card" id="mark-card" hidden>
-      <h2>Set timestamps</h2>
-      <p id="mark-hint" class="muted">
-        Open the player, then mark start and end for a mute or skip section.
+      <h2>Add filter while playing</h2>
+      <p class="muted">
+        Type times like <strong>10:14</strong> or <strong>1:02:03</strong>, or
+        press <strong>Now</strong> to use the current player time.
       </p>
       <p id="mark-clock" class="clock">--:--</p>
-      <div class="mark-row">
-        <button type="button" id="btn-mark-start" class="btn">Mark start</button>
-        <button type="button" id="btn-mark-end" class="btn">Mark end</button>
+      <div class="time-row">
+        <label class="time-label" for="input-from">From</label>
+        <input
+          id="input-from"
+          class="text-input time-input"
+          type="text"
+          inputmode="numeric"
+          placeholder="10:14"
+          autocomplete="off"
+        />
+        <button type="button" id="btn-mark-start" class="btn btn-now">Now</button>
       </div>
-      <div class="mark-bounds">
-        <span id="mark-start-label">Start: —</span>
-        <span id="mark-end-label">End: —</span>
+      <div class="time-row">
+        <label class="time-label" for="input-to">To</label>
+        <input
+          id="input-to"
+          class="text-input time-input"
+          type="text"
+          inputmode="numeric"
+          placeholder="11:50"
+          autocomplete="off"
+        />
+        <button type="button" id="btn-mark-end" class="btn btn-now">Now</button>
       </div>
       <div class="mark-row">
         <label class="action-pick">
@@ -63,20 +80,21 @@
         placeholder="Optional label (e.g. swearing)"
       />
       <button type="button" id="btn-save-filter" class="btn btn-primary" disabled>
-        Save filter
+        Save mute / skip filter
       </button>
       <p id="mark-status" class="muted mark-status" hidden></p>
     </section>
 
     <section class="card" id="saved-card" hidden>
-      <h2>Saved filters</h2>
+      <h2>Filters for this title</h2>
+      <p id="saved-detail" class="muted"></p>
       <ul id="saved-list" class="filters"></ul>
     </section>
 
     <footer class="footer">
       <p class="muted">
-        Mark timestamps while the player is running. Filters are saved to the
-        SCF backend for this title or episode.
+        Filters are keyed by Amazon GTI for this movie or episode and applied
+        automatically while you watch.
       </p>
     </footer>
 

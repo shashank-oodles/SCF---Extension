@@ -1,5 +1,6 @@
 import type { FilterInterval, PlaybackSnapshot } from '../types';
 import { logger } from '../utils/logger';
+import { videoTimeFor } from './contentClock';
 
 /**
  * Applies timestamp-based skip intervals with seek-loop protection.
@@ -86,7 +87,7 @@ export class SkipFilter {
     });
 
     try {
-      video.currentTime = hit.end;
+      video.currentTime = videoTimeFor(hit.end);
     } catch (err) {
       this.pendingSeek = false;
       this.pendingTarget = null;

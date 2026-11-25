@@ -181,6 +181,11 @@ h1 {
   border: 1px solid var(--ink-100);
 }
 
+.filters li.empty-row {
+  color: var(--ink-500);
+  border-style: dashed;
+}
+
 .filters .action {
   font-weight: 650;
   text-transform: uppercase;
@@ -295,6 +300,94 @@ h1 {
 
 .mark-status {
   margin-top: 8px;
+}
+
+.time-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.time-label {
+  width: 38px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--ink-700);
+}
+
+.time-input {
+  flex: 1;
+  margin-bottom: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.time-input.invalid {
+  border-color: var(--danger);
+}
+
+.btn-now {
+  flex: none;
+  width: 64px;
+}
+
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--ink-200);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: scf-spin 0.8s linear infinite;
+  flex: none;
+}
+
+.btn-primary .spinner {
+  border-color: rgba(255, 255, 255, 0.4);
+  border-top-color: white;
+}
+
+.loader {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-500);
+  font-size: 12px;
+}
+
+.loader-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px dashed var(--ink-200);
+  border-radius: 8px;
+  color: var(--ink-500);
+  font-size: 12px;
+}
+
+.btn-loading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+@keyframes scf-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2s;
+  }
+}
+
+.clock.ad {
+  font-size: 18px;
+  color: var(--warn);
 }
 
 .mark-status.error {

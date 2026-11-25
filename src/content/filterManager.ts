@@ -111,6 +111,12 @@ export class FilterManager {
       return;
     }
 
+    if (snapshot.adPlaying) {
+      // Release any filter-owned mute; ad time is not title time.
+      this.muteFilter.reset(video);
+      return;
+    }
+
     // Skip evaluation while buffering if a seek is already pending
     if (snapshot.waiting && this.skipFilter.isSeekPending()) return;
 

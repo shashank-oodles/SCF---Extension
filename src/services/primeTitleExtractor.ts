@@ -215,17 +215,39 @@ function scrapeEpisodesFromPage(showTitle?: string): PrimeEpisode[] {
     .slice(0, 40);
 }
 
+/** Cheap show-page check: season picker or an "S1 E5"-style play/resume button. */
+export function looksLikeShowDetailPage(): boolean {
+  if (
+    document.querySelector(
+      '[data-testid*="season" i], [data-automation-id*="season" i], [aria-label*="season" i]'
+    )
+  ) {
+    return true;
+  }
+  const playButtons = document.querySelectorAll(
+    '[data-testid*="play" i], [data-automation-id*="play" i], [data-testid*="resume" i]'
+  );
+  for (const el of Array.from(playButtons).slice(0, 10)) {
+    if (/\bS\d+\s*E\d+\b/i.test(el.textContent || '')) return true;
+  }
+  return false;
+}
+
 /**
  * Extract what Prime Video is currently showing — no backend matching.
  */
 export function extractPrimePageInfo(
   pageUrl: string = location.href,
-  documentTitle: string = document.title
+  documentTitle: string = document.title,
+  playerOpen = false
 ): PrimePageInfo {
   const sources: string[] = [];
 
-  const playerTitle = readText('.atvwebplayersdk-title-text');
-  const playerSubtitle = readText('.atvwebplayersdk-subtitle-text');
+  // Prime leaves the closed player's DOM (with the last title) in the page.
+  const playerTitle = playerOpen ? readText('.atvwebplayersdk-title-text') : '';
+  const playerSubtitle = playerOpen
+    ? readText('.atvwebplayersdk-subtitle-text')
+    : '';
   const autoTitle = readText('[data-automation-id="title"]');
   const autoSubtitle = readText('[data-automation-id="subtitle"]');
   const h1 = readText('h1');
@@ -290,6 +312,11 @@ export function extractPrimePageInfo(
       episodes.push(...scraped);
       sources.push(`domEpisodeList:${scraped.length}`);
     }
+  }
+
+  if (kind === 'unknown' && looksLikeShowDetailPage()) {
+    kind = 'show';
+    sources.push('domShowSignal');
   }
 
   // If still unknown and title looks like a feature film page with no season

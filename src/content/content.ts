@@ -1,5 +1,6 @@
 import {
   extractPrimePageInfo,
+  looksLikeShowDetailPage,
   type PrimePageInfo,
 } from '../services/primeTitleExtractor';
 import {
@@ -11,10 +12,15 @@ import {
   resetPrimeCatalog,
   subscribePrimeCatalog,
 } from '../services/primeCatalog';
-import type { ExtensionStatus } from '../types';
+import {
+  tryResolveFiltersByQuery,
+} from '../services/filterApi';
+import type { ExtensionStatus, TitleFilterConfig } from '../types';
 import type { SidePanelState } from '../types/panel';
 import { logger } from '../utils/logger';
 import { StatusDot } from '../utils/statusDot';
+import { contentTimeOf, isAdPlaying, resetContentClock } from './contentClock';
+import { FilterManager } from './filterManager';
 import {
   getPrimaryPlaybackVideo,
   invalidatePlayerGateCache,
@@ -24,8 +30,14 @@ import { VideoDetector } from './videoDetector';
 
 const REFRESH_MS = 4_000;
 const PLAYBACK_TICK_MS = 1_000;
+const FILTER_SYNC_MS = 8_000;
 
 const statusDot = new StatusDot();
+const filterManager = new FilterManager((status, detail) => {
+  uiStatus = status;
+  if (detail) uiDetail = detail;
+  publishState();
+});
 
 let detected: PrimePageInfo | null = null;
 let selectedEpisode: string | null = null;
@@ -39,6 +51,9 @@ let lastPlayerOpen = false;
 let detector: VideoDetector | null = null;
 let sidePanelOpen = false;
 let contextInvalidated = false;
+let filterSyncGti = '';
+let filterSyncInFlight = false;
+let openedPanelForPlayback = false;
 
 function syncStatusDot(): void {
   const active = Boolean(
@@ -48,11 +63,12 @@ function syncStatusDot(): void {
   statusDot.setVisible(!sidePanelOpen);
 }
 
+/** Title (content) time, excluding stitched-in ad time. */
 function readPlaybackTime(): number | null {
   if (!isPlayerOpen()) return null;
   const video = getPrimaryPlaybackVideo() ?? detector?.getCurrent() ?? null;
-  if (!video) return null;
-  return Number.isFinite(video.currentTime) ? video.currentTime : null;
+  if (!video || !Number.isFinite(video.currentTime)) return null;
+  return contentTimeOf(video);
 }
 
 function resetSelection(reason: string): void {
@@ -60,7 +76,92 @@ function resetSelection(reason: string): void {
   selectedGti = null;
   detected = null;
   lastFingerprint = '';
+  filterSyncGti = '';
+  filterManager.destroy();
   logger.info('Selection reset', { reason });
+}
+
+function activePlaybackGti(): string | null {
+  return selectedGti || detected?.gti || getPrimeCatalog().playingGti || null;
+}
+
+function emptyConfigForGti(gti: string): TitleFilterConfig {
+  return {
+    titleId: `pending:${gti}`,
+    title: detected?.title || 'Prime title',
+    kind: detected?.kind === 'show' ? 'show' : 'movie',
+    episodeName: selectedEpisode || detected?.episodeName,
+    gti,
+    provider: 'prime-video',
+    videoUrl: detected?.pageUrl || `gti://${gti}`,
+    matchPatterns: [gti],
+    filters: [],
+  };
+}
+
+async function syncPlaybackFilters(force = false): Promise<void> {
+  if (contextInvalidated || filterSyncInFlight) return;
+
+  const playerOpen = isPlayerOpen();
+  const gti = activePlaybackGti();
+  const video = getPrimaryPlaybackVideo();
+
+  if (!playerOpen || !gti || !video) {
+    filterManager.detachVideo();
+    filterSyncGti = '';
+    return;
+  }
+
+  if (!force && filterSyncGti === gti && filterManager.isActive()) {
+    return;
+  }
+
+  filterSyncInFlight = true;
+  try {
+    const config =
+      (await tryResolveFiltersByQuery(gti)) || emptyConfigForGti(gti);
+    if (contextInvalidated) return;
+    if (activePlaybackGti() !== gti || !isPlayerOpen()) return;
+
+    filterManager.loadConfig(config);
+    filterManager.attachVideo(video);
+    filterSyncGti = gti;
+    logger.info('Playback filters synced', {
+      gti,
+      count: config.filters.length,
+    });
+  } catch (err) {
+    logger.warn('Failed to sync playback filters', err);
+    uiStatus = 'backend_failed';
+    uiDetail = 'Could not load filters from backend';
+    publishState();
+  } finally {
+    filterSyncInFlight = false;
+  }
+}
+
+function maybeOpenPanelForPlayback(): void {
+  if (openedPanelForPlayback || sidePanelOpen) return;
+  if (!isPlayerOpen() || !activePlaybackGti()) return;
+  openedPanelForPlayback = true;
+  openSidePanelFromDot();
+}
+
+let lastPublishedSignature = '';
+
+/** Lightweight clock update for the side panel — no title/episode payload. */
+function publishPlaybackTime(): void {
+  const currentTime = readPlaybackTime();
+  void chrome.runtime
+    .sendMessage({
+      type: 'SCF_TIME_UPDATE',
+      playerOpen: currentTime != null,
+      currentTime,
+      adPlaying: currentTime != null && isAdPlaying(),
+    })
+    .catch(() => {
+      if (!chrome.runtime?.id) contextInvalidated = true;
+    });
 }
 
 function publishState(detailOverride?: string): void {
@@ -68,6 +169,24 @@ function publishState(detailOverride?: string): void {
 
   const playerOpen = isPlayerOpen();
   const gti = detected?.gti || selectedGti || undefined;
+
+  // Skip identical full-state sends; the clock travels separately.
+  const signature = JSON.stringify([
+    playerOpen,
+    uiStatus,
+    uiDetail,
+    selectedEpisode,
+    gti,
+    detected?.title,
+    detected?.kind,
+    detected?.episodeName,
+    detected?.seasonLabel,
+    detected?.episodes.map((e) => `${e.titleId || ''}:${e.name}:${e.nowPlaying ? 1 : 0}`),
+  ]);
+  syncStatusDot();
+  if (signature === lastPublishedSignature) return;
+  lastPublishedSignature = signature;
+
   const state: SidePanelState = {
     playerOpen,
     sidePanelOpen,
@@ -177,6 +296,9 @@ function refreshDetectedTitle(force = false): void {
     selectedEpisode = null;
     lastFingerprint = '';
     lastPlayerOpen = false;
+    openedPanelForPlayback = false;
+    filterManager.detachVideo();
+    filterSyncGti = '';
     force = true;
   } else if (!lastPlayerOpen && playerOpen) {
     // New watch session — drop previous playing identity; keep detail episode list
@@ -184,7 +306,11 @@ function refreshDetectedTitle(force = false): void {
     selectedEpisode = null;
     lastFingerprint = '';
     lastPlayerOpen = true;
+    openedPanelForPlayback = false;
+    resetContentClock();
     force = true;
+    // Deferred: replay notifies catalog subscribers, which re-enter this function.
+    window.setTimeout(replayPendingNetwork, 0);
   } else {
     lastPlayerOpen = playerOpen;
   }
@@ -198,7 +324,7 @@ function refreshDetectedTitle(force = false): void {
     lastPageKey = pageKey;
   }
 
-  const info = extractPrimePageInfo(location.href, document.title);
+  const info = extractPrimePageInfo(location.href, document.title, playerOpen);
 
   // Prefer live catalog GTI even if extractor title came from DOM
   const catalog = getPrimeCatalog();
@@ -237,6 +363,8 @@ function refreshDetectedTitle(force = false): void {
           ? `${selectedEpisode || 'Episode'} · ${gti}`
           : `Title · ${gti}`;
       publishState();
+      maybeOpenPanelForPlayback();
+      void syncPlaybackFilters();
       return;
     }
     uiStatus = 'title_not_matched';
@@ -267,20 +395,30 @@ function refreshDetectedTitle(force = false): void {
   }
 
   publishState();
+  maybeOpenPanelForPlayback();
+  void syncPlaybackFilters();
 }
 
 function onNavigation(): void {
   const href = location.href;
   const pageKey = pageKeyFromUrl(href);
+  lastHref = href;
 
-  if (href === lastHref && pageKey === lastPageKey) {
+  // Query-string churn on the same title is not a new page.
+  if (pageKey === lastPageKey) {
     refreshDetectedTitle();
     return;
   }
 
-  lastHref = href;
   lastPageKey = pageKey;
   lastPlayerOpen = false;
+  // Prime may fetch the new title's metadata before the URL changes.
+  const cutoff = Date.now() - PENDING_NETWORK_MS;
+  const prefetched = pendingNetwork
+    .filter((p) => p.at >= cutoff && isCatalogCandidate(p.data))
+    .pop()?.data;
+  pendingNetwork.length = 0;
+  pendingDetailMovie = null;
   invalidatePlayerGateCache();
   resetPrimeCatalog(pageKey);
   resetSelection('navigation');
@@ -288,29 +426,207 @@ function onNavigation(): void {
   uiDetail = 'Navigated — detecting title…';
   publishState();
   refreshDetectedTitle(true);
+  if (prefetched) queueDetailIdentity(prefetched);
 }
 
+/**
+ * SPA navigation is announced by the MAIN-world hook (page-world history
+ * calls are invisible here). A cheap href poll covers anything it misses.
+ */
 function watchSpaNavigation(): void {
-  const pushState = history.pushState.bind(history);
-  history.pushState = function (...args) {
-    pushState(...args);
-    onNavigation();
-  };
-
-  const replaceState = history.replaceState.bind(history);
-  history.replaceState = function (...args) {
-    replaceState(...args);
-    onNavigation();
-  };
-
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    const data = event.data as { source?: string; type?: string } | null;
+    if (data?.source === 'SCF_PRIME_NETWORK' && data.type === 'navigation') {
+      onNavigation();
+    }
+  });
   window.addEventListener('popstate', onNavigation);
+  window.setInterval(() => {
+    if (!contextInvalidated && location.href !== lastHref) onNavigation();
+  }, 1_000);
+}
+
+const PENDING_NETWORK_MS = 10_000;
+const pendingNetwork: Array<{ at: number; data: Record<string, unknown> }> = [];
+
+function isCatalogMessage(data: unknown): data is Record<string, unknown> {
+  return (
+    Boolean(data) &&
+    typeof data === 'object' &&
+    (data as Record<string, unknown>).source === 'SCF_PRIME_NETWORK' &&
+    (data as Record<string, unknown>).type === 'catalog'
+  );
+}
+
+/**
+ * Outside the watch player (detail-page hero trailer) keep only the show's
+ * episode list; drop any "now playing" identity, which belongs to the trailer.
+ */
+function toEpisodeListOnly(
+  msg: Record<string, unknown>
+): Record<string, unknown> | null {
+  if (msg.api !== 'playerChrome') return null;
+  const episodes = Array.isArray(msg.episodes) ? msg.episodes : [];
+  if (episodes.length === 0) return null;
+  return {
+    ...msg,
+    contentKind: 'show',
+    playingGti: null,
+    focusEpisodeId: null,
+    movieTitle: null,
+    episodeTitle: null,
+    seasonNumber: null,
+    episodeNumber: null,
+    gtis: [],
+  };
+}
+
+function normalizeTitle(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function readDetailPageTitle(): string {
+  const h1 = document.querySelector('h1');
+  const fromH1 =
+    h1?.textContent?.trim() ||
+    h1?.querySelector('img')?.getAttribute('alt')?.trim() ||
+    '';
+  if (fromH1) return fromH1;
+  return document.title
+    .replace(/^prime video:\s*/i, '')
+    .replace(/\s*[|–—-]\s*prime video.*$/i, '')
+    .trim();
+}
+
+function titlesMatch(a: string, b: string): boolean {
+  const x = normalizeTitle(a);
+  const y = normalizeTitle(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  return Math.min(x.length, y.length) >= 4 && (x.includes(y) || y.includes(x));
+}
+
+/** "Resume S2 E6" / "Play S1 E1" on the detail page's primary button. */
+function readResumeEpisodeLabel(): { season: number; episode: number } | null {
+  const candidates = document.querySelectorAll('main button, main a[href*="/detail/"], [data-testid*="play" i]');
+  const max = Math.min(candidates.length, 40);
+  for (let i = 0; i < max; i++) {
+    const match = candidates[i].textContent?.match(/\bS(\d+)\s*E(\d+)\b/i);
+    if (match) return { season: Number(match[1]), episode: Number(match[2]) };
+  }
+  return null;
+}
+
+function isCatalogCandidate(msg: Record<string, unknown>): boolean {
+  return (
+    msg.api === 'playerChrome' &&
+    typeof msg.playingGti === 'string' &&
+    (typeof msg.movieTitle === 'string' || typeof msg.seriesTitle === 'string')
+  );
+}
+
+/**
+ * Detail-page play/resume metadata (catalogMetadataV2 + playbackRestrictions)
+ * is trusted only if it describes this page — the hero trailer fires the same
+ * call with its own entity.
+ */
+function isDetailPageIdentity(msg: Record<string, unknown>): boolean {
+  if (!isCatalogCandidate(msg)) return false;
+  const heading = readDetailPageTitle();
+
+  if (msg.contentKind === 'movie') {
+    if (getPrimeCatalog().episodes.length > 0 || looksLikeShowDetailPage()) {
+      return false;
+    }
+    return titlesMatch(String(msg.movieTitle), heading);
+  }
+
+  if (msg.contentKind === 'show') {
+    if (typeof msg.seasonNumber !== 'number' || typeof msg.episodeNumber !== 'number') {
+      return false;
+    }
+    if (!titlesMatch(String(msg.seriesTitle || ''), heading)) return false;
+    const resume = readResumeEpisodeLabel();
+    return (
+      !resume ||
+      (resume.season === msg.seasonNumber && resume.episode === msg.episodeNumber)
+    );
+  }
+  return false;
+}
+
+let pendingDetailMovie: Record<string, unknown> | null = null;
+const DETAIL_RETRY_MS = [500, 1_500, 3_000, 6_000];
+
+function queueDetailIdentity(msg: Record<string, unknown>): void {
+  pendingDetailMovie = msg;
+  tryApplyDetailMovie();
+  if (!pendingDetailMovie) return;
+  for (const delay of DETAIL_RETRY_MS) {
+    window.setTimeout(() => {
+      if (pendingDetailMovie === msg) tryApplyDetailMovie();
+    }, delay);
+  }
+}
+let recheckScheduled = false;
+
+/**
+ * Prime's player calls arrive just before the player is detectable; re-check
+ * shortly instead of waiting for the periodic refresh to replay them.
+ */
+function schedulePlayerRecheck(): void {
+  if (recheckScheduled) return;
+  recheckScheduled = true;
+  for (const delay of [300, 1_000]) {
+    window.setTimeout(() => {
+      invalidatePlayerGateCache();
+      refreshDetectedTitle();
+      if (delay === 1_000) recheckScheduled = false;
+    }, delay);
+  }
+}
+
+/** The metadata call can land before the page heading renders; retry briefly. */
+function tryApplyDetailMovie(): void {
+  if (!pendingDetailMovie || isPlayerOpen()) return;
+  if (isDetailPageIdentity(pendingDetailMovie)) {
+    const msg = pendingDetailMovie;
+    pendingDetailMovie = null;
+    applyPrimeNetworkMessage(msg);
+  }
+}
+
+/** Player APIs often fire just before the player DOM is detectable. */
+function replayPendingNetwork(): void {
+  const cutoff = Date.now() - PENDING_NETWORK_MS;
+  const recent = pendingNetwork.filter((p) => p.at >= cutoff);
+  pendingNetwork.length = 0;
+  for (const { data } of recent) applyPrimeNetworkMessage(data);
 }
 
 function listenForPrimeNetwork(): void {
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
-    if (!applyPrimeNetworkMessage(event.data)) return;
-    // applyPrimeNetworkMessage already notifies catalog subscribers
+    const data = event.data;
+    if (!isCatalogMessage(data)) {
+      applyPrimeNetworkMessage(data);
+      return;
+    }
+
+    if (isPlayerOpen()) {
+      applyPrimeNetworkMessage(data);
+      return;
+    }
+
+    pendingNetwork.push({ at: Date.now(), data });
+    if (pendingNetwork.length > 8) pendingNetwork.shift();
+    schedulePlayerRecheck();
+
+    const listOnly = toEpisodeListOnly(data);
+    if (listOnly) applyPrimeNetworkMessage(listOnly);
+
+    if (isCatalogCandidate(data)) queueDetailIdentity(data);
   });
   // Single refresh path — avoid double extract on every network hit
   subscribePrimeCatalog(() => {
@@ -328,6 +644,13 @@ function listenForSidePanelMessages(): void {
     }
 
     if (message?.type === 'SCF_GET_PLAYBACK_TIME') {
+      if (isPlayerOpen() && isAdPlaying()) {
+        sendResponse({
+          ok: false,
+          error: 'Ad is playing — wait for the title to resume',
+        });
+        return false;
+      }
       const t = readPlaybackTime();
       if (t == null) {
         sendResponse({
@@ -366,8 +689,16 @@ function listenForSidePanelMessages(): void {
         ? `${detected.title} · ${message.episodeName}`
         : message.episodeName;
       publishState();
+      void syncPlaybackFilters(true);
       sendResponse({ ok: true });
       return false;
+    }
+
+    if (message?.type === 'SCF_FILTERS_CHANGED') {
+      void syncPlaybackFilters(true).then(() => {
+        sendResponse({ ok: true });
+      });
+      return true;
     }
 
     return false;
@@ -400,14 +731,21 @@ function init(): void {
   refreshDetectedTitle(true);
 
   window.setInterval(() => {
-    if (!contextInvalidated) refreshDetectedTitle();
+    if (!contextInvalidated && !document.hidden) refreshDetectedTitle();
   }, REFRESH_MS);
 
-  // Light tick for side-panel clock only — no title re-extract
+  // Clock-only tick, sent only while the side panel is visible.
   window.setInterval(() => {
-    if (contextInvalidated || !sidePanelOpen || !isPlayerOpen()) return;
-    publishState();
+    if (contextInvalidated || !sidePanelOpen || document.hidden) return;
+    if (!isPlayerOpen()) return;
+    publishPlaybackTime();
   }, PLAYBACK_TICK_MS);
+
+  window.setInterval(() => {
+    if (!contextInvalidated && isPlayerOpen()) {
+      void syncPlaybackFilters();
+    }
+  }, FILTER_SYNC_MS);
 }
 
 init();

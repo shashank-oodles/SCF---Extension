@@ -32,8 +32,9 @@ export interface SidePanelState {
   selectedEpisode?: string | null;
   selectedGti?: string | null;
 
-  /** Live player clock (seconds) when player is open */
+  /** Live title clock (seconds, ads excluded) when player is open */
   currentTime?: number | null;
+  adPlaying?: boolean;
 
   /** Saved filters for the active title/episode (from backend) */
   savedFilters?: Array<{

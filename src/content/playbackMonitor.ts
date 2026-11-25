@@ -1,5 +1,6 @@
 import type { PlaybackSnapshot } from '../types';
 import { logger } from '../utils/logger';
+import { contentTimeOf, isAdPlaying } from './contentClock';
 
 export type PlaybackEventName =
   | 'play'
@@ -91,7 +92,8 @@ export class PlaybackMonitor {
 
   private buildSnapshot(video: HTMLVideoElement): PlaybackSnapshot {
     return {
-      currentTime: video.currentTime,
+      currentTime: contentTimeOf(video),
+      adPlaying: isAdPlaying(),
       paused: video.paused,
       seeking: video.seeking,
       playbackRate: video.playbackRate,
