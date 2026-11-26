@@ -156,6 +156,23 @@ export function applyPrimeNetworkMessage(data: unknown): boolean {
   }
   if (msg.type !== 'catalog') return false;
 
+  // One page is either a show or a movie. Once this page is known to be a show
+  // (episode metadata or episode list), a MOVIE-type entity is the background
+  // preview/trailer — never what the user plays. Pressing Play on the resume
+  // episode fires no new episode call, so accepting it (live or replayed from
+  // the buffer) would leave the title stuck as a movie.
+  if (
+    msg.api === 'playerChrome' &&
+    msg.contentKind === 'movie' &&
+    catalog.contentKind === 'show' &&
+    catalog.pageKey === pageKeyFromUrl()
+  ) {
+    logger.info('Ignored preview movie entity on a show page', {
+      gti: msg.playingGti,
+    });
+    return false;
+  }
+
   const before = catalogSignature(catalog);
   const changed = applyCatalogMessage(msg);
   if (!changed || catalogSignature(catalog) === before) return false;

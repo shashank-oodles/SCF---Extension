@@ -186,6 +186,49 @@ h1 {
   border-style: dashed;
 }
 
+.filters li > span:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.filters .filter-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.btn-delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-500);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.btn-delete:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.btn-delete.armed {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: var(--danger);
+  font-weight: 650;
+}
+
+.btn-delete:disabled {
+  cursor: default;
+}
+
 .filters .action {
   font-weight: 650;
   text-transform: uppercase;

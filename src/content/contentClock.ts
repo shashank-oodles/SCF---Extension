@@ -7,20 +7,25 @@
  * the player's time indicator and keep it between UI updates.
  */
 
-const AD_SELECTORS = [
-  '.atvwebplayersdk-ad-timer',
-  '.atvwebplayersdk-adtimeindicator-text',
-  '[class*="adtimeindicator" i]',
-  '[class*="ad-timer" i]',
-].join(', ');
+import { WATCH_PLAYER_ROOT_SELECTOR } from './playbackVideo';
+
+const AD_SELECTORS =
+  '.atvwebplayersdk-ad-timer, .atvwebplayersdk-adtimeindicator-text';
 
 const TIME_INDICATOR_SELECTOR = '.atvwebplayersdk-timeindicator-text';
 
 /** Displayed time is floored to whole seconds, so samples jitter by <1s. */
 const SEGMENT_JUMP_S = 2;
+const SAMPLE_CACHE_MS = 500;
 
 let offset = 0;
 let lastDisplayed: number | null = null;
+let cachedAd: { at: number; value: boolean } | null = null;
+let lastSampledAt = 0;
+
+function playerRoot(): ParentNode {
+  return document.querySelector(WATCH_PLAYER_ROOT_SELECTOR) ?? document;
+}
 
 export function parseClock(text: string): number | null {
   const match = text.trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})$/);
@@ -30,17 +35,27 @@ export function parseClock(text: string): number | null {
 }
 
 export function isAdPlaying(): boolean {
-  const el = document.querySelector(AD_SELECTORS);
-  return Boolean(el && (el.textContent || '').trim());
+  const now = Date.now();
+  if (cachedAd && now - cachedAd.at < SAMPLE_CACHE_MS) {
+    return cachedAd.value;
+  }
+  const el = playerRoot().querySelector(AD_SELECTORS);
+  const value = Boolean(el && (el.textContent || '').trim());
+  cachedAd = { at: now, value };
+  return value;
 }
 
 function readDisplayedContentTime(): number | null {
-  const text = document.querySelector(TIME_INDICATOR_SELECTOR)?.textContent;
+  const text = playerRoot().querySelector(TIME_INDICATOR_SELECTOR)?.textContent;
   if (!text || !text.includes('/')) return null;
   return parseClock(text.split('/')[0]);
 }
 
 function sampleOffset(video: HTMLVideoElement): void {
+  const now = Date.now();
+  if (now - lastSampledAt < SAMPLE_CACHE_MS) return;
+  lastSampledAt = now;
+
   if (isAdPlaying()) return;
   const displayed = readDisplayedContentTime();
   if (displayed == null) return;
@@ -68,4 +83,6 @@ export function videoTimeFor(contentTime: number): number {
 export function resetContentClock(): void {
   offset = 0;
   lastDisplayed = null;
+  cachedAd = null;
+  lastSampledAt = 0;
 }

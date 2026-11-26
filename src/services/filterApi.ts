@@ -218,11 +218,24 @@ export async function appendFiltersForTitle(options: {
 
   let config = await tryResolveFiltersByQuery(gti);
 
+  // A stored show must never be downgraded to a movie by a save made while the
+  // page was momentarily mis-detected; it keeps its episode name too.
+  const resolvedKind: 'movie' | 'show' =
+    kind === 'show' || config?.kind === 'show' ? 'show' : 'movie';
+  const resolvedEpisode =
+    resolvedKind === 'show'
+      ? episodeName?.trim() || config?.episodeName?.trim() || undefined
+      : undefined;
+
+  if (resolvedKind === 'show' && !resolvedEpisode) {
+    throw new Error('Episode name not detected yet — wait a moment and try again');
+  }
+
   if (!config) {
     config = await createTitleConfig({
       title,
-      kind,
-      episodeName: kind === 'show' ? episodeName : undefined,
+      kind: resolvedKind,
+      episodeName: resolvedEpisode,
       gti,
       videoUrl,
       provider: 'prime-video',
@@ -239,12 +252,36 @@ export async function appendFiltersForTitle(options: {
   const merged = [...config.filters, ...filters];
   return publishTitleFilters(config.titleId, {
     title,
-    kind,
-    episodeName: kind === 'show' ? episodeName : undefined,
+    kind: resolvedKind,
+    episodeName: resolvedEpisode,
     gti,
     videoUrl,
     matchPatterns: mergedPatterns,
     filters: merged,
+  });
+}
+
+/** Remove one filter from the title stored for this GTI. */
+export async function removeFilterFromTitle(
+  gti: string,
+  filterId: string
+): Promise<TitleFilterConfig> {
+  const config = await tryResolveFiltersByQuery(gti);
+  if (!config) {
+    throw new Error('No saved filters found for this title');
+  }
+  if (!config.filters.some((f) => f.id === filterId)) {
+    return config; // already gone
+  }
+
+  return publishTitleFilters(config.titleId, {
+    title: config.title,
+    kind: config.kind,
+    episodeName: config.episodeName,
+    gti: config.gti ?? gti,
+    videoUrl: config.videoUrl,
+    matchPatterns: config.matchPatterns,
+    filters: config.filters.filter((f) => f.id !== filterId),
   });
 }
 

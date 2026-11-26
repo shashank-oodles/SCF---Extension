@@ -7,14 +7,13 @@ import {
 export { findWatchPlayerVideo, WATCH_PLAYER_ROOT_SELECTOR } from './playbackVideo';
 
 let cachedOpen: { at: number; value: boolean } | null = null;
-const CACHE_MS = 250;
+const CACHE_MS = 500;
 
 /**
  * True only when the full Prime Video watch player is open.
  * Detail-page hero trailers / glimpses must return false.
  *
- * Kept cheap: no full-document button scans or elementFromPoint.
- * Result is cached briefly so timers/polls don't thrash layout.
+ * Result is cached briefly so timers/events don't thrash layout.
  */
 export function isPlayerOpen(): boolean {
   const now = Date.now();
@@ -31,7 +30,16 @@ export function invalidatePlayerGateCache(): void {
   cachedOpen = null;
 }
 
+/** The watch player only ever runs on a title's /detail/ URL. */
+function isDetailUrl(): boolean {
+  return /\/detail\/[A-Za-z0-9]+/i.test(location.pathname);
+}
+
 function computePlayerOpen(): boolean {
+  // Home/browse hero trailers can use the same player markup; they never
+  // live on a detail URL, so reject them before any DOM work.
+  if (!isDetailUrl()) return false;
+
   // Fast path: watch-player chrome / root present
   if (!hasWatchPlayerSignals() && !isLargePlayerRoot()) {
     return false;

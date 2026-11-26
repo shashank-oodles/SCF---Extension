@@ -2,6 +2,7 @@ import type { FilterAction, FilterInterval, ExtensionStatus } from '../types';
 import type { SidePanelState } from '../types/panel';
 import {
   appendFiltersForTitle,
+  removeFilterFromTitle,
   tryResolveFiltersByQuery,
 } from '../services/filterApi';
 
@@ -34,15 +35,25 @@ let loadingKey = '';
 let lastAuthorGti = '';
 let saving = false;
 let fetchingTime: 'start' | 'end' | null = null;
+let armedDeleteId: string | null = null;
+let deletingFilterId: string | null = null;
+let armTimer: number | null = null;
 
 /** Stop spinning if Prime never delivers (e.g. GTI not exposed on this page). */
 const LOADER_TIMEOUT_MS = 8_000;
 const waitingSince = new Map<string, number>();
 
 function isStillWaiting(key: string): boolean {
+  const now = Date.now();
   const started = waitingSince.get(key);
   if (started == null) {
-    waitingSince.set(key, Date.now());
+    // Prune expired entries so the map stays tiny across long sessions.
+    if (waitingSince.size > 20) {
+      for (const [k, at] of waitingSince) {
+        if (now - at >= LOADER_TIMEOUT_MS) waitingSince.delete(k);
+      }
+    }
+    waitingSince.set(key, now);
     window.setTimeout(() => {
       if (!latestState) return;
       lastRenderSignature = '';
@@ -50,7 +61,7 @@ function isStillWaiting(key: string): boolean {
     }, LOADER_TIMEOUT_MS + 50);
     return true;
   }
-  return Date.now() - started < LOADER_TIMEOUT_MS;
+  return now - started < LOADER_TIMEOUT_MS;
 }
 
 function loaderHtml(text: string): string {
@@ -261,17 +272,96 @@ function renderSavedFilters(
   }
 
   savedList.innerHTML = filters
-    .map(
-      (f) => `
+    .map((f) => {
+      const deleting = deletingFilterId === f.id;
+      const armed = armedDeleteId === f.id;
+      const deleteBtn = deleting
+        ? `<button type="button" class="btn-delete" disabled aria-label="Deleting filter"><span class="spinner" aria-hidden="true"></span></button>`
+        : `<button type="button" class="btn-delete${armed ? ' armed' : ''}" data-id="${escapeHtml(
+            f.id
+          )}" aria-label="Delete filter" title="${
+            armed ? 'Click again to confirm' : 'Delete filter'
+          }">${armed ? 'Delete?' : '✕'}</button>`;
+      return `
       <li>
         <span>${escapeHtml(f.label || f.id)} · ${formatTime(f.start)}–${formatTime(
           f.end
         )}</span>
-        <span class="action">${escapeHtml(f.action)}</span>
-      </li>`
-    )
+        <span class="filter-right">
+          <span class="action">${escapeHtml(f.action)}</span>
+          ${deleteBtn}
+        </span>
+      </li>`;
+    })
     .join('');
 }
+
+function savedContextLabel(state: SidePanelState): string {
+  const episode = activeEpisode(state);
+  const title = state.detected?.title || 'Title';
+  return state.detected?.kind === 'show' && episode ? `${title} · ${episode}` : title;
+}
+
+function rerenderSaved(): void {
+  if (latestState) renderSavedFilters(savedFilters, savedContextLabel(latestState));
+}
+
+function clearArmTimer(): void {
+  if (armTimer !== null) {
+    window.clearTimeout(armTimer);
+    armTimer = null;
+  }
+}
+
+async function onDeleteFilter(filterId: string): Promise<void> {
+  const state = latestState;
+  const gti = state ? activeGti(state) : null;
+  if (!state || !gti || deletingFilterId) return;
+
+  const removed = savedFilters.find((f) => f.id === filterId);
+  clearArmTimer();
+  armedDeleteId = null;
+  deletingFilterId = filterId;
+  rerenderSaved();
+
+  try {
+    const config = await removeFilterFromTitle(gti, filterId);
+    deletingFilterId = null;
+    renderSavedFilters(config.filters, savedContextLabel(state));
+    notifyContentFiltersChanged(gti);
+    setMarkStatus(
+      removed
+        ? `Deleted ${removed.action} ${formatTime(removed.start)}–${formatTime(removed.end)}`
+        : 'Filter deleted',
+      'ok'
+    );
+  } catch (err) {
+    deletingFilterId = null;
+    rerenderSaved();
+    setMarkStatus(err instanceof Error ? err.message : 'Delete failed', 'error');
+  }
+}
+
+// Two-step delete: first click arms the button, a second click within 3s deletes.
+savedList.addEventListener('click', (event) => {
+  const btn = (event.target as HTMLElement).closest<HTMLButtonElement>('.btn-delete');
+  const id = btn?.dataset.id;
+  if (!btn || !id || deletingFilterId) return;
+
+  if (armedDeleteId === id) {
+    void onDeleteFilter(id);
+    return;
+  }
+
+  clearArmTimer();
+  armedDeleteId = id;
+  rerenderSaved();
+  armTimer = window.setTimeout(() => {
+    armTimer = null;
+    armedDeleteId = null;
+    rerenderSaved();
+  }, 3_000);
+});
 
 async function refreshSavedFilters(
   state: SidePanelState,
@@ -285,12 +375,7 @@ async function refreshSavedFilters(
     return;
   }
 
-  const episode = activeEpisode(state);
-  const title = state.detected?.title || 'Title';
-  const contextLabel =
-    state.detected?.kind === 'show' && episode
-      ? `${title} · ${episode}`
-      : title;
+  const contextLabel = savedContextLabel(state);
 
   const stableKey = `gti|${gti}`;
   if (!force && stableKey === loadingKey) return;
@@ -659,27 +744,53 @@ async function loadState(): Promise<void> {
   });
 }
 
-function connectPanelPort(): void {
-  const port = chrome.runtime.connect({ name: 'scf-sidepanel' });
-  port.onMessage.addListener((message) => {
-    if (message?.type === 'SCF_STATE' && message.state) {
-      render(message.state as SidePanelState);
-    }
-  });
-}
+let reconnectTimer: number | null = null;
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message?.type === 'SCF_STATE' && message.state) {
+function handleIncomingMessage(message: Record<string, unknown> | null): void {
+  if (!message) return;
+  if (message.type === 'SCF_STATE' && message.state) {
     render(message.state as SidePanelState);
     return;
   }
-  if (message?.type === 'SCF_TIME') {
+  if (message.type === 'SCF_TIME') {
     applyTimeUpdate(
       Boolean(message.playerOpen),
       typeof message.currentTime === 'number' ? message.currentTime : null,
       Boolean(message.adPlaying)
     );
   }
+}
+
+function connectPanelPort(): void {
+  if (reconnectTimer !== null) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  let port: chrome.runtime.Port;
+  try {
+    port = chrome.runtime.connect({ name: 'scf-sidepanel' });
+  } catch {
+    reconnectTimer = window.setTimeout(connectPanelPort, 1_000);
+    return;
+  }
+
+  port.onMessage.addListener((message) => {
+    handleIncomingMessage(message as Record<string, unknown> | null);
+  });
+
+  // MV3 service workers suspend after ~30s idle; reconnect immediately so the
+  // side panel never freezes when the worker restarts.
+  port.onDisconnect.addListener(() => {
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      connectPanelPort();
+    }, 250);
+  });
+}
+
+chrome.runtime.onMessage.addListener((message) => {
+  handleIncomingMessage(message as Record<string, unknown> | null);
 });
 
 connectPanelPort();

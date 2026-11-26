@@ -23,7 +23,63 @@ let latestState: SidePanelState = {
 
 /** tabId that last reported SCF state (Prime player tab) */
 let activeTabId: number | null = null;
-let sidePanelPorts = 0;
+const panelPorts = new Set<chrome.runtime.Port>();
+
+function hasOpenPanel(): boolean {
+  return panelPorts.size > 0;
+}
+
+function postToPanels(message: Record<string, unknown>): void {
+  for (const port of panelPorts) {
+    try {
+      port.postMessage(message);
+    } catch {
+      panelPorts.delete(port);
+    }
+  }
+}
+
+function isPrimeUrl(url?: string): boolean {
+  return Boolean(url && /primevideo\.com|amazon\.com\/(?:gp\/video|[^/]+\/video)/i.test(url));
+}
+
+async function requestActiveTabSync(tabIdOverride?: number): Promise<void> {
+  let tabId = tabIdOverride ?? activeTabId;
+  let tabUrl: string | undefined;
+
+  if (tabId == null) {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = tabs[0]?.id ?? null;
+    tabUrl = tabs[0]?.url;
+  } else {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      tabUrl = tab.url;
+    } catch {
+      tabId = null;
+    }
+  }
+
+  if (tabId == null) return;
+  activeTabId = tabId;
+
+  if (tabUrl && !isPrimeUrl(tabUrl)) {
+    resetStateForNavigation('Open a movie or show on Prime Video');
+    return;
+  }
+
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: 'SCF_SYNC_REQUEST',
+      sidePanelOpen: hasOpenPanel(),
+    });
+  } catch {
+    // Content script isn't attached (e.g. tab wasn't refreshed after extension reload)
+    if (tabUrl && isPrimeUrl(tabUrl)) {
+      resetStateForNavigation('Refresh this Prime Video tab to reconnect SCF.');
+    }
+  }
+}
 
 async function resolveApiBase(): Promise<string> {
   try {
@@ -84,7 +140,7 @@ async function proxyApi(
 function withPanelFlag(state: SidePanelState): SidePanelState {
   return {
     ...state,
-    sidePanelOpen: sidePanelPorts > 0,
+    sidePanelOpen: hasOpenPanel(),
     updatedAt: Date.now(),
   };
 }
@@ -93,10 +149,8 @@ let lastNotifiedPanelOpen: boolean | null = null;
 
 function broadcastState(state: SidePanelState): void {
   latestState = withPanelFlag(state);
-  if (sidePanelPorts === 0) return;
-  void chrome.runtime.sendMessage({ type: 'SCF_STATE', state: latestState }).catch(() => {
-    // receivers may be closed
-  });
+  if (!hasOpenPanel()) return;
+  postToPanels({ type: 'SCF_STATE', state: latestState });
 }
 
 function notifyTabPanelVisibility(open: boolean): void {
@@ -112,12 +166,10 @@ function notifyTabPanelVisibility(open: boolean): void {
 function setSidePanelOpen(open: boolean): void {
   latestState = withPanelFlag({ ...latestState, sidePanelOpen: open });
   if (open) {
-    void chrome.runtime
-      .sendMessage({ type: 'SCF_STATE', state: latestState })
-      .catch(() => {});
+    postToPanels({ type: 'SCF_STATE', state: latestState });
   }
   notifyTabPanelVisibility(open);
-  logger.info('Side panel visibility', { open, ports: sidePanelPorts });
+  logger.info('Side panel visibility', { open, ports: panelPorts.size });
 }
 
 chrome.runtime.onInstalled.addListener((details) => {
@@ -141,7 +193,7 @@ void chrome.sidePanel
 function resetStateForNavigation(detail: string): void {
   broadcastState({
     playerOpen: false,
-    sidePanelOpen: sidePanelPorts > 0,
+    sidePanelOpen: hasOpenPanel(),
     status: 'initialized',
     statusDetail: detail,
     detected: null,
@@ -160,14 +212,24 @@ function detailPageKey(url: string): string {
 // Drop the cached title whenever the Prime tab moves to a different page, so the
 // panel never shows a stale title (e.g. after the content script was invalidated).
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (tabId !== activeTabId || !changeInfo.url) return;
+  if (!changeInfo.url) return;
+  if (activeTabId == null && tab.active) activeTabId = tabId;
+  if (tabId !== activeTabId) return;
   const previous = latestState.detected?.pageUrl;
   if (previous && detailPageKey(previous) === detailPageKey(changeInfo.url)) return;
   resetStateForNavigation(
-    tab.url && /primevideo\.com|amazon\.com/.test(tab.url)
+    isPrimeUrl(tab.url)
       ? 'Navigated — detecting title…'
       : 'Open a movie or show on Prime Video'
   );
+});
+
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  activeTabId = tabId;
+  lastNotifiedPanelOpen = null;
+  if (hasOpenPanel()) {
+    void requestActiveTabSync(tabId);
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -179,13 +241,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== PANEL_PORT) return;
 
-  sidePanelPorts += 1;
+  panelPorts.add(port);
   setSidePanelOpen(true);
-  port.postMessage({ type: 'SCF_STATE', state: latestState });
+  // Ask the active tab for fresh state (covers MV3 service-worker restarts).
+  void requestActiveTabSync();
 
   port.onDisconnect.addListener(() => {
-    sidePanelPorts = Math.max(0, sidePanelPorts - 1);
-    setSidePanelOpen(sidePanelPorts > 0);
+    panelPorts.delete(port);
+    setSidePanelOpen(hasOpenPanel());
   });
 });
 
@@ -264,7 +327,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       lastNotifiedPanelOpen = null;
     }
     broadcastState(message.state as SidePanelState);
-    sendResponse({ ok: true, sidePanelOpen: sidePanelPorts > 0 });
+    sendResponse({ ok: true, sidePanelOpen: hasOpenPanel() });
     return false;
   }
 
@@ -276,15 +339,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         typeof message.currentTime === 'number' ? message.currentTime : null,
       adPlaying: Boolean(message.adPlaying),
     };
-    if (sidePanelPorts > 0) {
-      void chrome.runtime
-        .sendMessage({
-          type: 'SCF_TIME',
-          playerOpen: latestState.playerOpen,
-          currentTime: latestState.currentTime,
-          adPlaying: latestState.adPlaying,
-        })
-        .catch(() => {});
+    if (hasOpenPanel()) {
+      postToPanels({
+        type: 'SCF_TIME',
+        playerOpen: latestState.playerOpen,
+        currentTime: latestState.currentTime,
+        adPlaying: latestState.adPlaying,
+      });
     }
     return false;
   }

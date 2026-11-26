@@ -28,9 +28,8 @@ import {
 } from './playerGate';
 import { VideoDetector } from './videoDetector';
 
-const REFRESH_MS = 4_000;
-const PLAYBACK_TICK_MS = 1_000;
-const FILTER_SYNC_MS = 8_000;
+const HEARTBEAT_MS = 1_000;
+const FALLBACK_REFRESH_TICKS = 10;
 
 const statusDot = new StatusDot();
 const filterManager = new FilterManager((status, detail) => {
@@ -99,8 +98,15 @@ function emptyConfigForGti(gti: string): TitleFilterConfig {
   };
 }
 
+let forceSyncQueued = false;
+
 async function syncPlaybackFilters(force = false): Promise<void> {
-  if (contextInvalidated || filterSyncInFlight) return;
+  if (contextInvalidated) return;
+  if (filterSyncInFlight) {
+    // A save/delete arrived mid-sync: run once more so the change isn't lost.
+    if (force) forceSyncQueued = true;
+    return;
+  }
 
   const playerOpen = isPlayerOpen();
   const gti = activePlaybackGti();
@@ -137,6 +143,10 @@ async function syncPlaybackFilters(force = false): Promise<void> {
     publishState();
   } finally {
     filterSyncInFlight = false;
+    if (forceSyncQueued) {
+      forceSyncQueued = false;
+      void syncPlaybackFilters(true);
+    }
   }
 }
 
@@ -148,16 +158,25 @@ function maybeOpenPanelForPlayback(): void {
 }
 
 let lastPublishedSignature = '';
+let lastTimeSignature = '';
 
-/** Lightweight clock update for the side panel — no title/episode payload. */
+/** Lightweight clock update for the side panel — skipped when unchanged. */
 function publishPlaybackTime(): void {
   const currentTime = readPlaybackTime();
+  const playerOpen = currentTime != null;
+  const adPlaying = playerOpen && isAdPlaying();
+  const signature = `${playerOpen ? 1 : 0}:${adPlaying ? 1 : 0}:${
+    currentTime != null ? Math.floor(currentTime) : ''
+  }`;
+  if (signature === lastTimeSignature) return;
+  lastTimeSignature = signature;
+
   void chrome.runtime
     .sendMessage({
       type: 'SCF_TIME_UPDATE',
-      playerOpen: currentTime != null,
+      playerOpen,
       currentTime,
-      adPlaying: currentTime != null && isAdPlaying(),
+      adPlaying,
     })
     .catch(() => {
       if (!chrome.runtime?.id) contextInvalidated = true;
@@ -210,8 +229,6 @@ function publishState(detailOverride?: string): void {
     currentTime: playerOpen ? readPlaybackTime() : null,
     updatedAt: Date.now(),
   };
-
-  syncStatusDot();
 
   void chrome.runtime
     .sendMessage({ type: 'SCF_STATE_UPDATE', state })
@@ -295,6 +312,7 @@ function refreshDetectedTitle(force = false): void {
     selectedGti = null;
     selectedEpisode = null;
     lastFingerprint = '';
+    lastTimeSignature = '';
     lastPlayerOpen = false;
     openedPanelForPlayback = false;
     filterManager.detachVideo();
@@ -305,6 +323,7 @@ function refreshDetectedTitle(force = false): void {
     selectedGti = null;
     selectedEpisode = null;
     lastFingerprint = '';
+    lastTimeSignature = '';
     lastPlayerOpen = true;
     openedPanelForPlayback = false;
     resetContentClock();
@@ -322,6 +341,12 @@ function refreshDetectedTitle(force = false): void {
     force = true;
   } else if (!lastPageKey) {
     lastPageKey = pageKey;
+  }
+
+  // Home / TV / Movies rows: only hero trailers play here, never a title.
+  if (!playerOpen && !isDetailPageKey(pageKey)) {
+    showNoTitle();
+    return;
   }
 
   const info = extractPrimePageInfo(location.href, document.title, playerOpen);
@@ -399,6 +424,23 @@ function refreshDetectedTitle(force = false): void {
   void syncPlaybackFilters();
 }
 
+function isDetailPageKey(pageKey: string = pageKeyFromUrl()): boolean {
+  return pageKey.startsWith('detail:');
+}
+
+/** Browse pages: clear any previous title so the panel never shows a stale one. */
+function showNoTitle(): void {
+  const catalog = getPrimeCatalog();
+  if (catalog.playingGti || catalog.episodes.length > 0 || catalog.seriesTitle || catalog.movieTitle) {
+    resetPrimeCatalog(pageKeyFromUrl());
+  }
+  if (detected || selectedGti || selectedEpisode) resetSelection('browse_page');
+  lastFingerprint = '';
+  uiStatus = 'initialized';
+  uiDetail = 'Open a movie or show on Prime Video.';
+  publishState();
+}
+
 function onNavigation(): void {
   const href = location.href;
   const pageKey = pageKeyFromUrl(href);
@@ -412,6 +454,8 @@ function onNavigation(): void {
 
   lastPageKey = pageKey;
   lastPlayerOpen = false;
+  lastTimeSignature = '';
+  clearPendingTimers();
   // Prime may fetch the new title's metadata before the URL changes.
   const cutoff = Date.now() - PENDING_NETWORK_MS;
   const prefetched = pendingNetwork
@@ -431,7 +475,7 @@ function onNavigation(): void {
 
 /**
  * SPA navigation is announced by the MAIN-world hook (page-world history
- * calls are invisible here). A cheap href poll covers anything it misses.
+ * calls are invisible here). The main heartbeat checks location.href as backup.
  */
 function watchSpaNavigation(): void {
   window.addEventListener('message', (event) => {
@@ -442,9 +486,6 @@ function watchSpaNavigation(): void {
     }
   });
   window.addEventListener('popstate', onNavigation);
-  window.setInterval(() => {
-    if (!contextInvalidated && location.href !== lastHref) onNavigation();
-  }, 1_000);
 }
 
 const PENDING_NETWORK_MS = 10_000;
@@ -558,32 +599,50 @@ function isDetailPageIdentity(msg: Record<string, unknown>): boolean {
 
 let pendingDetailMovie: Record<string, unknown> | null = null;
 const DETAIL_RETRY_MS = [500, 1_500, 3_000, 6_000];
+let detailRetryTimers: number[] = [];
+let recheckTimers: number[] = [];
+
+function clearDetailRetryTimers(): void {
+  for (const id of detailRetryTimers) window.clearTimeout(id);
+  detailRetryTimers = [];
+}
+
+function clearRecheckTimers(): void {
+  for (const id of recheckTimers) window.clearTimeout(id);
+  recheckTimers = [];
+}
+
+function clearPendingTimers(): void {
+  clearDetailRetryTimers();
+  clearRecheckTimers();
+}
 
 function queueDetailIdentity(msg: Record<string, unknown>): void {
+  clearDetailRetryTimers();
   pendingDetailMovie = msg;
   tryApplyDetailMovie();
   if (!pendingDetailMovie) return;
   for (const delay of DETAIL_RETRY_MS) {
-    window.setTimeout(() => {
+    const id = window.setTimeout(() => {
       if (pendingDetailMovie === msg) tryApplyDetailMovie();
     }, delay);
+    detailRetryTimers.push(id);
   }
 }
-let recheckScheduled = false;
 
 /**
  * Prime's player calls arrive just before the player is detectable; re-check
- * shortly instead of waiting for the periodic refresh to replay them.
+ * shortly instead of waiting for the heartbeat to replay them.
  */
 function schedulePlayerRecheck(): void {
-  if (recheckScheduled) return;
-  recheckScheduled = true;
+  if (recheckTimers.length > 0) return;
   for (const delay of [300, 1_000]) {
-    window.setTimeout(() => {
+    const id = window.setTimeout(() => {
       invalidatePlayerGateCache();
       refreshDetectedTitle();
-      if (delay === 1_000) recheckScheduled = false;
+      if (delay === 1_000) recheckTimers = [];
     }, delay);
+    recheckTimers.push(id);
   }
 }
 
@@ -593,6 +652,7 @@ function tryApplyDetailMovie(): void {
   if (isDetailPageIdentity(pendingDetailMovie)) {
     const msg = pendingDetailMovie;
     pendingDetailMovie = null;
+    clearDetailRetryTimers();
     applyPrimeNetworkMessage(msg);
   }
 }
@@ -608,7 +668,10 @@ function replayPendingNetwork(): void {
 function listenForPrimeNetwork(): void {
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
-    const data = event.data;
+    const data = event.data as Record<string, unknown> | null;
+    if (!data || typeof data !== 'object' || data.source !== 'SCF_PRIME_NETWORK') {
+      return;
+    }
     if (!isCatalogMessage(data)) {
       applyPrimeNetworkMessage(data);
       return;
@@ -622,6 +685,10 @@ function listenForPrimeNetwork(): void {
     pendingNetwork.push({ at: Date.now(), data });
     if (pendingNetwork.length > 8) pendingNetwork.shift();
     schedulePlayerRecheck();
+
+    // Off detail pages these calls belong to hero trailers; keep them only
+    // buffered in case the watch player opens.
+    if (!isDetailPageKey()) return;
 
     const listOnly = toEpisodeListOnly(data);
     if (listOnly) applyPrimeNetworkMessage(listOnly);
@@ -639,6 +706,19 @@ function listenForSidePanelMessages(): void {
     if (message?.type === 'SCF_PANEL_VISIBILITY') {
       sidePanelOpen = Boolean(message.sidePanelOpen);
       syncStatusDot();
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    if (message?.type === 'SCF_SYNC_REQUEST') {
+      if (typeof message.sidePanelOpen === 'boolean') {
+        sidePanelOpen = message.sidePanelOpen;
+      }
+      invalidatePlayerGateCache();
+      lastPublishedSignature = '';
+      lastTimeSignature = '';
+      refreshDetectedTitle(true);
+      if (sidePanelOpen && isPlayerOpen()) publishPlaybackTime();
       sendResponse({ ok: true });
       return false;
     }
@@ -730,22 +810,42 @@ function init(): void {
   resetPrimeCatalog(lastPageKey);
   refreshDetectedTitle(true);
 
+  // Single lightweight heartbeat replaces 4 separate polling intervals:
+  // - catches SPA URL changes missed by the history hook
+  // - detects player open/close transitions and only then re-extracts title
+  // - pushes clock updates only while the panel is visible and time changed
+  // - syncs playback filters if the active GTI hasn't been synced yet
+  let heartbeatTicks = 0;
   window.setInterval(() => {
-    if (!contextInvalidated && !document.hidden) refreshDetectedTitle();
-  }, REFRESH_MS);
-
-  // Clock-only tick, sent only while the side panel is visible.
-  window.setInterval(() => {
-    if (contextInvalidated || !sidePanelOpen || document.hidden) return;
-    if (!isPlayerOpen()) return;
-    publishPlaybackTime();
-  }, PLAYBACK_TICK_MS);
-
-  window.setInterval(() => {
-    if (!contextInvalidated && isPlayerOpen()) {
-      void syncPlaybackFilters();
+    if (contextInvalidated) return;
+    if (location.href !== lastHref) {
+      onNavigation();
+      return;
     }
-  }, FILTER_SYNC_MS);
+    if (document.hidden) return;
+
+    heartbeatTicks += 1;
+    const playerOpen = isPlayerOpen();
+
+    if (playerOpen !== lastPlayerOpen) {
+      refreshDetectedTitle();
+    } else if (
+      heartbeatTicks % FALLBACK_REFRESH_TICKS === 0 &&
+      pageKeyFromUrl().startsWith('detail:') &&
+      (!detected?.title || !activePlaybackGti())
+    ) {
+      // Slow fallback only if we still haven't identified the detail page.
+      refreshDetectedTitle();
+    }
+
+    if (playerOpen) {
+      if (sidePanelOpen) publishPlaybackTime();
+      const gti = activePlaybackGti();
+      if (gti && (filterSyncGti !== gti || !filterManager.isActive())) {
+        void syncPlaybackFilters();
+      }
+    }
+  }, HEARTBEAT_MS);
 }
 
 init();

@@ -75,37 +75,30 @@ export function pickActiveVideo(
 }
 
 export class VideoDetector {
-  private pollId: number | null = null;
   private debounceId: number | null = null;
   private current: HTMLVideoElement | null = null;
   private readonly onChange: VideoChangeHandler;
-  private readonly pollMs: number;
 
-  constructor(onChange: VideoChangeHandler, pollMs = 3000) {
+  constructor(onChange: VideoChangeHandler) {
     this.onChange = onChange;
-    this.pollMs = pollMs;
   }
 
   start(): void {
     this.scan();
 
-    // No document-wide MutationObserver: Prime mutates the DOM constantly and
-    // observing the whole subtree costs CPU on every batch. A <video> appearing
-    // also fires a capturing `loadedmetadata`, which is enough to react quickly.
+    // Purely event-driven: no document-wide MutationObserver or polling loop.
+    // Capturing media events fire whenever a <video> loads or starts playing.
     document.addEventListener('loadedmetadata', this.onMediaEvent, true);
     document.addEventListener('play', this.onMediaEvent, true);
+    document.addEventListener('ended', this.onMediaEvent, true);
 
-    this.pollId = window.setInterval(() => this.scan(), this.pollMs);
     logger.info('VideoDetector started');
   }
 
   stop(): void {
     document.removeEventListener('loadedmetadata', this.onMediaEvent, true);
     document.removeEventListener('play', this.onMediaEvent, true);
-    if (this.pollId !== null) {
-      window.clearInterval(this.pollId);
-      this.pollId = null;
-    }
+    document.removeEventListener('ended', this.onMediaEvent, true);
     if (this.debounceId !== null) {
       window.clearTimeout(this.debounceId);
       this.debounceId = null;
